@@ -171,6 +171,33 @@
               "description": "Effort level (e.g., \"low\", \"medium\", \"high\", \"none\", \"adaptive\")"
             }
           ]
+        },
+        "task_budget": {
+          "description": "Default total-token budget for an agentic task (forwarded to Anthropic as `output_config.task_budget`, with the required `task-budgets-2026-03-13` beta header attached automatically). Configurable on any Claude model — docker-agent does not gate by model name — but at the time of writing only Claude Opus 4.7 honors it. Accepts an integer token count or an object {type: tokens, total: N}.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Token budget for the full task (combined thinking, tool calls, and output)."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": ["tokens"],
+                  "description": "Budget kind. Only \"tokens\" is supported today."
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Total budget value."
+                }
+              },
+              "required": ["total"],
+              "additionalProperties": false
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -607,7 +634,7 @@
         },
         "provider_opts": {
           "type": "object",
-          "description": "Provider-specific options. Sampling parameters: top_k (integer, supported by anthropic, google, amazon-bedrock, and custom OpenAI-compatible providers like vLLM/Ollama), repetition_penalty (float, forwarded to custom OpenAI-compatible providers), min_p (float, forwarded to custom providers), seed (integer, forwarded to OpenAI). Infrastructure options: dmr: runtime_flags. anthropic/amazon-bedrock (Claude): interleaved_thinking (boolean, default true). openai: transport ('sse' or 'websocket') to choose between SSE and WebSocket streaming for the Responses API. openai/anthropic/google: rerank_prompt (string) to fully override the system prompt used for RAG reranking (advanced - prefer using results.reranking.criteria for domain-specific guidance). Google: google_search (boolean) enables Google Search grounding, google_maps (boolean) enables Google Maps grounding, code_execution (boolean) enables server-side code execution.",
+          "description": "Provider-specific options. Sampling parameters: top_k (integer, supported by anthropic, google, amazon-bedrock, and custom OpenAI-compatible providers like vLLM/Ollama), repetition_penalty (float, forwarded to custom OpenAI-compatible providers), min_p (float, forwarded to custom providers), seed (integer, forwarded to OpenAI). Infrastructure options: dmr: runtime_flags. anthropic/amazon-bedrock (Claude): interleaved_thinking (boolean, default true), thinking_display ('summarized', 'omitted', or 'display') controls whether thinking blocks are returned in responses when thinking is enabled. Claude Opus 4.7 hides thinking by default ('omitted'); set thinking_display: summarized (or thinking_display: display) to receive thinking blocks. openai: transport ('sse' or 'websocket') to choose between SSE and WebSocket streaming for the Responses API. openai/anthropic/google: rerank_prompt (string) to fully override the system prompt used for RAG reranking (advanced - prefer using results.reranking.criteria for domain-specific guidance). Google: google_search (boolean) enables Google Search grounding, google_maps (boolean) enables Google Maps grounding, code_execution (boolean) enables server-side code execution.",
           "additionalProperties": true
         },
         "track_usage": {
@@ -615,12 +642,12 @@
           "description": "Whether to track usage"
         },
         "thinking_budget": {
-          "description": "Controls reasoning effort/budget. Use 'none' or 0 to disable thinking. OpenAI: string levels ('minimal','low','medium','high','xhigh'). Anthropic: integer token budget (1024-32768), 'adaptive' (adaptive thinking with high effort by default), 'adaptive/<effort>' where effort is low/medium/high/max (adaptive thinking with specified effort), or effort levels ('low','medium','high','max') which use adaptive thinking with the given effort. Amazon Bedrock (Claude): integer token budget or effort levels ('low','medium','high') mapped to token budgets. Google Gemini 2.5: integer token budget (-1 for dynamic, 0 to disable, 24576 max). Google Gemini 3: string levels ('minimal' Flash only,'low','medium','high'). Thinking is only enabled when explicitly configured.",
+          "description": "Controls reasoning effort/budget. Use 'none' or 0 to disable thinking. OpenAI: string levels ('minimal','low','medium','high','xhigh'). Anthropic: integer token budget (1024-32768), 'adaptive' (adaptive thinking with high effort by default), 'adaptive/<effort>' where effort is low/medium/high/xhigh/max ('xhigh' is supported by Claude Opus 4.7+), or effort levels ('low','medium','high','xhigh','max') which use adaptive thinking with the given effort. Amazon Bedrock (Claude): integer token budget or effort levels ('low','medium','high') mapped to token budgets. Google Gemini 2.5: integer token budget (-1 for dynamic, 0 to disable, 24576 max). Google Gemini 3: string levels ('minimal' Flash only,'low','medium','high'). Thinking is only enabled when explicitly configured.",
           "oneOf": [
             {
               "type": "string",
-              "pattern": "^(none|minimal|low|medium|high|xhigh|max|adaptive(/low|/medium|/high|/max)?)$",
-              "description": "Reasoning effort level. 'adaptive' uses adaptive thinking with high effort (default). 'adaptive/<effort>' specifies the effort level (low/medium/high/max). Use 'none' to disable thinking."
+              "pattern": "^(none|minimal|low|medium|high|xhigh|max|adaptive(/low|/medium|/high|/xhigh|/max)?)$",
+              "description": "Reasoning effort level. 'adaptive' uses adaptive thinking with high effort (default). 'adaptive/<effort>' specifies the effort level (low/medium/high/xhigh/max). 'adaptive/xhigh' requires Claude Opus 4.7+. Use 'none' to disable thinking."
             },
             {
               "type": "integer",
@@ -642,11 +669,44 @@
             "adaptive/low",
             "adaptive/medium",
             "adaptive/high",
+            "adaptive/xhigh",
             "adaptive/max",
             -1,
             1024,
             8192,
             32768
+          ]
+        },
+        "task_budget": {
+          "description": "Total-token budget for a full agentic task (forwarded to Anthropic as `output_config.task_budget`, with the required `task-budgets-2026-03-13` beta header attached automatically). Limits the combined tokens spent on thinking, tool calls, and output across the whole task. Configurable on any Claude model — docker-agent does not gate by model name — but at the time of writing only Claude Opus 4.7 honors it. Accepts an integer token count or an object {type: tokens, total: N}.",
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Total token budget for the task (e.g., 128000)."
+            },
+            {
+              "type": "object",
+              "properties": {
+                "type": {
+                  "type": "string",
+                  "enum": ["tokens"],
+                  "description": "Budget kind. Only \"tokens\" is supported today."
+                },
+                "total": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "description": "Total budget value."
+                }
+              },
+              "required": ["total"],
+              "additionalProperties": false
+            }
+          ],
+          "examples": [
+            64000,
+            128000,
+            { "type": "tokens", "total": 128000 }
           ]
         },
         "routing": {

@@ -24,6 +24,7 @@ models:
     base_url: string # Optional: custom API endpoint
     token_key: string # Optional: env var for API token
     thinking_budget: string|int # Optional: reasoning effort
+    task_budget: int|object # Optional: total task token budget (Anthropic)
     parallel_tool_calls: boolean # Optional: allow parallel tool calls
     track_usage: boolean # Optional: track token usage
     routing: [list] # Optional: rule-based model routing
@@ -45,6 +46,7 @@ models:
 | `base_url`            | string     | ✗        | Custom API endpoint URL (for self-hosted or proxied endpoints)                        |
 | `token_key`           | string     | ✗        | Environment variable name containing the API token (overrides provider default)       |
 | `thinking_budget`     | string/int | ✗        | Reasoning effort control                                                              |
+| `task_budget`         | int/object | ✗        | Total token budget for an agentic task (forwarded to Anthropic; see [Task Budget](#task-budget)). |
 | `parallel_tool_calls` | boolean    | ✗        | Allow model to call multiple tools at once                                            |
 | `track_usage`         | boolean    | ✗        | Track and report token usage for this model                                           |
 | `routing`             | array      | ✗        | Rule-based routing to different models. See [Model Routing]({{ '/configuration/routing/' | relative_url }}). |
@@ -110,6 +112,58 @@ Works for all providers:
 thinking_budget: none # or 0
 ```
 
+## Task Budget
+
+**Anthropic-only.**
+
+`task_budget` caps the **total** number of tokens the model may spend across a
+multi-step agentic task — combining thinking, tool calls, and final output
+tokens. It lets long-running agents self-regulate effort without having to
+choose a tight per-call `max_tokens`.
+
+It is forwarded to Anthropic's
+[`output_config.task_budget`](https://platform.claude.com/docs/en/about-claude/models/whats-new-claude-4-7)
+request field. docker-agent automatically attaches the required
+`task-budgets-2026-03-13` beta header whenever this field is set.
+
+You can configure `task_budget` on **any** Claude model — docker-agent never
+gates it by model name. At the time of writing only **Claude Opus 4.7**
+actually honors the field; other Claude models will reject requests that
+include it. Check the Anthropic release notes linked above for the current
+list of supported models.
+
+### Integer shorthand
+
+```yaml
+models:
+  opus:
+    provider: anthropic
+    model: claude-opus-4-7
+    task_budget: 128000 # total tokens for the whole task
+    thinking_budget: adaptive # works nicely together
+```
+
+### Object form
+
+Equivalent, and forward-compatible with future budget types:
+
+```yaml
+models:
+  opus:
+    provider: anthropic
+    model: claude-opus-4-7
+    task_budget:
+      type: tokens # only "tokens" is supported today
+      total: 128000
+```
+
+Setting `task_budget: 0` (or omitting the field) disables the feature — the
+model falls back to the provider's default behavior.
+
+Like other inheritable model settings, `task_budget` can also be declared on a
+[provider definition]({{ '/providers/custom/' | relative_url }}) and is
+inherited by every model that references that provider.
+
 ## Interleaved Thinking
 
 For Anthropic and Bedrock Claude models, interleaved thinking allows tool calls during model reasoning. This is enabled by default:
@@ -123,6 +177,22 @@ models:
     provider_opts:
       interleaved_thinking: false # disable if needed
 ```
+
+## Thinking Display (Anthropic)
+
+For Anthropic Claude models, `thinking_display` controls whether thinking blocks are returned in responses when thinking is enabled. Claude Opus 4.7 hides thinking content by default (`omitted`); set this provider option to receive summarized thinking:
+
+```yaml
+models:
+  opus-4-7:
+    provider: anthropic
+    model: claude-opus-4-7
+    thinking_budget: adaptive
+    provider_opts:
+      thinking_display: summarized # "summarized", "display", or "omitted"
+```
+
+See the [Anthropic provider page](/providers/anthropic/#thinking-display) for details.
 
 ## Examples by Provider
 
