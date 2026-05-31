@@ -9,8 +9,10 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
 
 	"github.com/docker/docker-agent/pkg/agent"
 	"github.com/docker/docker-agent/pkg/config"
@@ -31,7 +33,7 @@ type ToolOutput struct {
 }
 
 func StartMCPServer(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig) error {
-	slog.Debug("Starting MCP server", "agent", agentFilename)
+	slog.DebugContext(ctx, "Starting MCP server", "agent", agentFilename)
 
 	server, cleanup, err := createMCPServer(ctx, agentFilename, agentName, runConfig)
 	if err != nil {
@@ -39,7 +41,7 @@ func StartMCPServer(ctx context.Context, agentFilename, agentName string, runCon
 	}
 	defer cleanup()
 
-	slog.Debug("MCP server starting with stdio transport")
+	slog.DebugContext(ctx, "MCP server starting with stdio transport")
 
 	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
 		return fmt.Errorf("MCP server error: %w", err)
@@ -50,7 +52,7 @@ func StartMCPServer(ctx context.Context, agentFilename, agentName string, runCon
 
 // StartHTTPServer starts a streaming HTTP MCP server on the given listener
 func StartHTTPServer(ctx context.Context, agentFilename, agentName string, runConfig *config.RuntimeConfig, ln net.Listener) error {
-	slog.Debug("Starting HTTP MCP server", "agent", agentFilename, "addr", ln.Addr())
+	slog.DebugContext(ctx, "Starting HTTP MCP server", "agent", agentFilename, "addr", ln.Addr())
 
 	server, cleanup, err := createMCPServer(ctx, agentFilename, agentName, runConfig)
 	if err != nil {
@@ -64,6 +66,7 @@ func StartHTTPServer(ctx context.Context, agentFilename, agentName string, runCo
 		Handler: mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 			return server
 		}, nil),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	errCh := make(chan error, 1)
@@ -95,14 +98,17 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 
 	cleanup := func() {
 		if err := t.StopToolSets(ctx); err != nil {
-			slog.Error("Failed to stop tool sets", "error", err)
+			slog.ErrorContext(ctx, "Failed to stop tool sets", "error", err)
 		}
 	}
 
+	// The SDK only starts keep-alive when KeepAlive > 0.
 	server := mcp.NewServer(&mcp.Implementation{
 		Name:    "docker agent",
 		Version: version.Version,
-	}, nil)
+	}, &mcp.ServerOptions{
+		KeepAlive: runConfig.MCPKeepAlive,
+	})
 
 	agentNames := t.AgentNames()
 	if agentName != "" {
@@ -113,7 +119,12 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 		agentNames = []string{agentName}
 	}
 
-	slog.Debug("Adding MCP tools for agents", "count", len(agentNames))
+	if runConfig.MCPToolName != "" && len(agentNames) > 1 {
+		cleanup()
+		return nil, nil, errors.New("--tool-name can only be used when exactly one agent is exposed")
+	}
+
+	slog.DebugContext(ctx, "Adding MCP tools for agents", "count", len(agentNames))
 
 	for _, agentName := range agentNames {
 		ag, err := t.Agent(agentName)
@@ -124,7 +135,7 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 
 		description := cmp.Or(ag.Description(), fmt.Sprintf("Run the %s agent", agentName))
 
-		slog.Debug("Adding MCP tool", "agent", agentName, "description", description)
+		slog.DebugContext(ctx, "Adding MCP tool", "agent", agentName, "description", description)
 
 		annotations, err := agentToolAnnotations(ctx, ag)
 		if err != nil {
@@ -135,7 +146,7 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 		annotations.Title = description
 
 		toolDef := &mcp.Tool{
-			Name:         agentName,
+			Name:         cmp.Or(runConfig.MCPToolName, agentName),
 			Description:  description,
 			Annotations:  annotations,
 			InputSchema:  tools.MustSchemaFor[ToolInput](),
@@ -150,7 +161,7 @@ func createMCPServer(ctx context.Context, agentFilename, agentName string, runCo
 
 func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mcp.CallToolRequest, ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
 	return func(ctx context.Context, req *mcp.CallToolRequest, input ToolInput) (*mcp.CallToolResult, ToolOutput, error) {
-		slog.Debug("MCP tool called", "agent", agentName, "message", input.Message)
+		slog.DebugContext(ctx, "MCP tool called", "agent", agentName, "message", input.Message)
 
 		ag, err := t.Agent(agentName)
 		if err != nil {
@@ -169,6 +180,8 @@ func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mc
 
 		rt, err := runtime.New(t,
 			runtime.WithCurrentAgent(agentName),
+			runtime.WithNonInteractive(true),
+			runtime.WithTracer(otel.Tracer("cagent")),
 		)
 		if err != nil {
 			return nil, ToolOutput{}, fmt.Errorf("failed to create runtime: %w", err)
@@ -176,13 +189,13 @@ func CreateToolHandler(t *team.Team, agentName string) func(context.Context, *mc
 
 		_, err = rt.Run(ctx, sess)
 		if err != nil {
-			slog.Error("Agent execution failed", "agent", agentName, "error", err)
+			slog.ErrorContext(ctx, "Agent execution failed", "agent", agentName, "error", err)
 			return nil, ToolOutput{}, fmt.Errorf("agent execution failed: %w", err)
 		}
 
 		result := cmp.Or(sess.GetLastAssistantMessageContent(), "No response from agent")
 
-		slog.Debug("Agent execution completed", "agent", agentName, "response_length", len(result))
+		slog.DebugContext(ctx, "Agent execution completed", "agent", agentName, "response_length", len(result))
 
 		return nil, ToolOutput{Response: result}, nil
 	}

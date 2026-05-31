@@ -6,6 +6,7 @@ import (
 
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/types"
+	"github.com/docker/docker-agent/pkg/hooks"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/tools"
 )
@@ -60,6 +61,8 @@ func UserMessage(message, sessionID string, multiContent []chat.MessagePart, ses
 		AgentContext:    newAgentContext(""),
 	}
 }
+
+func (e *UserMessageEvent) GetSessionID() string { return e.SessionID }
 
 // PartialToolCallEvent is sent when a tool call is first received (partial/complete)
 type PartialToolCallEvent struct {
@@ -155,6 +158,8 @@ func StreamStarted(sessionID, agentName string) Event {
 	}
 }
 
+func (e *StreamStartedEvent) GetSessionID() string { return e.SessionID }
+
 type AgentChoiceEvent struct {
 	AgentContext
 
@@ -193,17 +198,45 @@ func AgentChoiceReasoning(agentName, sessionID, content string) Event {
 	}
 }
 
+// ErrorCode constants classify errors so external consumers (boards,
+// dashboards) can react programmatically without parsing free-form messages.
+//
+// The three overflow codes ([ErrorCodeContextExceeded],
+// [ErrorCodeRequestTooLarge], [ErrorCodeMediaTooLarge]) mirror
+// [modelerrors.OverflowKind] and let clients render distinct, actionable
+// messages for each shape (token-count overflow, wire-level body cap,
+// media-size rejection) instead of one generic "context window exceeded".
+const (
+	ErrorCodeModelError      = "model_error"
+	ErrorCodeRateLimited     = "rate_limited"
+	ErrorCodeContextExceeded = "context_exceeded"  // OverflowKindTokens
+	ErrorCodeRequestTooLarge = "request_too_large" // OverflowKindWire
+	ErrorCodeMediaTooLarge   = "media_too_large"   // OverflowKindMedia
+	ErrorCodeToolFailed      = "tool_failed"
+	ErrorCodeHookBlocked     = "hook_blocked"
+	ErrorCodeLoopDetected    = "loop_detected"
+)
+
 type ErrorEvent struct {
 	AgentContext
 
 	Type  string `json:"type"`
 	Error string `json:"error"`
+	Code  string `json:"code,omitempty"`
 }
 
 func Error(msg string) Event {
 	return &ErrorEvent{
 		Type:  "error",
 		Error: msg,
+	}
+}
+
+func ErrorWithCode(code, msg string) Event {
+	return &ErrorEvent{
+		Type:  "error",
+		Error: msg,
+		Code:  code,
 	}
 }
 
@@ -302,6 +335,11 @@ func NewTokenUsageEvent(sessionID, agentName string, usage *Usage) Event {
 	}
 }
 
+// GetSessionID makes TokenUsageEvent satisfy [SessionScoped] so the
+// observer fan-out can drop sub-session events without each observer
+// re-implementing the check.
+func (e *TokenUsageEvent) GetSessionID() string { return e.SessionID }
+
 // SessionUsage builds a Usage from the session's current token counts, the
 // model's context limit, and the session's own cost.
 func SessionUsage(sess *session.Session, contextLimit int64) *Usage {
@@ -330,6 +368,8 @@ func SessionTitle(sessionID, title string) Event {
 	}
 }
 
+func (e *SessionTitleEvent) GetSessionID() string { return e.SessionID }
+
 type SessionSummaryEvent struct {
 	AgentContext
 
@@ -349,6 +389,8 @@ func SessionSummary(sessionID, summary, agentName string, firstKeptEntry int) Ev
 	}
 }
 
+func (e *SessionSummaryEvent) GetSessionID() string { return e.SessionID }
+
 type SessionCompactionEvent struct {
 	AgentContext
 
@@ -366,20 +408,26 @@ func SessionCompaction(sessionID, status, agentName string) Event {
 	}
 }
 
+func (e *SessionCompactionEvent) GetSessionID() string { return e.SessionID }
+
 type StreamStoppedEvent struct {
 	AgentContext
 
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
-func StreamStopped(sessionID, agentName string) Event {
+func StreamStopped(sessionID, agentName, reason string) Event {
 	return &StreamStoppedEvent{
 		Type:         "stream_stopped",
 		SessionID:    sessionID,
 		AgentContext: newAgentContext(agentName),
+		Reason:       reason,
 	}
 }
+
+func (e *StreamStoppedEvent) GetSessionID() string { return e.SessionID }
 
 // ElicitationRequestEvent is sent when an elicitation request is received from an MCP server
 type ElicitationRequestEvent struct {
@@ -607,6 +655,61 @@ func RAGIndexingCompleted(ragName, strategyName string) Event {
 	}
 }
 
+// HookStartedEvent is emitted when a configured hook event begins dispatching.
+type HookStartedEvent struct {
+	AgentContext
+
+	Type      string          `json:"type"`
+	SessionID string          `json:"session_id"`
+	HookEvent hooks.EventType `json:"hook_event"`
+}
+
+func (e *HookStartedEvent) GetSessionID() string { return e.SessionID }
+
+func HookStarted(event hooks.EventType, sessionID, agentName string) Event {
+	return &HookStartedEvent{
+		Type:         "hook_started",
+		SessionID:    sessionID,
+		HookEvent:    event,
+		AgentContext: newAgentContext(agentName),
+	}
+}
+
+// HookFinishedEvent is emitted when a configured hook event completes.
+type HookFinishedEvent struct {
+	AgentContext
+
+	Type       string          `json:"type"`
+	SessionID  string          `json:"session_id"`
+	HookEvent  hooks.EventType `json:"hook_event"`
+	DurationMs int64           `json:"duration_ms"`
+	Allowed    bool            `json:"allowed"`
+	Error      string          `json:"error,omitempty"`
+	Message    string          `json:"message,omitempty"`
+}
+
+func (e *HookFinishedEvent) GetSessionID() string { return e.SessionID }
+
+func HookFinished(event hooks.EventType, sessionID string, result *hooks.Result, dispatchErr error, duration time.Duration, agentName string) Event {
+	e := &HookFinishedEvent{
+		Type:         "hook_finished",
+		SessionID:    sessionID,
+		HookEvent:    event,
+		DurationMs:   duration.Milliseconds(),
+		Allowed:      true,
+		AgentContext: newAgentContext(agentName),
+	}
+	if result != nil {
+		e.Allowed = result.Allowed
+		e.Message = result.Message
+	}
+	if dispatchErr != nil {
+		e.Allowed = false
+		e.Error = dispatchErr.Error()
+	}
+	return e
+}
+
 // HookBlockedEvent is sent when a pre-tool hook blocks a tool call
 type HookBlockedEvent struct {
 	AgentContext
@@ -664,5 +767,39 @@ func SubSessionCompleted(parentSessionID string, subSession any, agentName strin
 		ParentSessionID: parentSessionID,
 		SubSession:      subSession,
 		AgentContext:    newAgentContext(agentName),
+	}
+}
+
+// ConnectionLostEvent is emitted when the connection to the remote server is lost
+type ConnectionLostEvent struct {
+	AgentContext
+
+	Type    string `json:"type"`
+	Reason  string `json:"reason"`
+	Attempt int    `json:"attempt"`
+}
+
+func ConnectionLost(reason string, attempt int) Event {
+	return &ConnectionLostEvent{
+		Type:         "connection_lost",
+		Reason:       reason,
+		Attempt:      attempt,
+		AgentContext: newAgentContext(""),
+	}
+}
+
+// ConnectionRestoredEvent is emitted when the connection to the remote server is restored
+type ConnectionRestoredEvent struct {
+	AgentContext
+
+	Type    string `json:"type"`
+	Attempt int    `json:"attempt"`
+}
+
+func ConnectionRestored(attempt int) Event {
+	return &ConnectionRestoredEvent{
+		Type:         "connection_restored",
+		Attempt:      attempt,
+		AgentContext: newAgentContext(""),
 	}
 }

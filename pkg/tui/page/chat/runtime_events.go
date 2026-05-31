@@ -226,6 +226,7 @@ func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd 
 	slog.Debug("handleStreamStopped called",
 		"agent", msg.AgentName,
 		"session_id", msg.SessionID,
+		"reason", msg.Reason,
 		"should_exit", p.app.ShouldExitAfterFirstResponse(),
 		"has_content", p.hasReceivedAssistantContent,
 		"stream_depth", p.streamDepth)
@@ -245,7 +246,10 @@ func (p *chatPage) handleStreamStopped(msg *runtime.StreamStoppedEvent) tea.Cmd 
 	}
 
 	// Outermost stream stopped — fully clean up.
-	if userconfig.Get().GetSound() {
+	// Only play the success sound when the stream completed normally.
+	// Errors already trigger a failure sound via ErrorEvent, and
+	// user-initiated cancels don't warrant a chime.
+	if userconfig.Get().GetSound() && isSuccessfulStop(msg.Reason) {
 		duration := time.Since(p.streamStartTime)
 		threshold := time.Duration(userconfig.Get().GetSoundThreshold()) * time.Second
 		if duration >= threshold {
@@ -286,7 +290,8 @@ func (p *chatPage) handleToolCallConfirmation(msg *runtime.ToolCallConfirmationE
 	spinnerCmd := p.setWorking(false)
 	toolCmd := p.messages.AddOrUpdateToolCall(msg.AgentName, msg.ToolCall, msg.ToolDefinition, types.ToolStatusConfirmation)
 	dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-		Model: dialog.NewToolConfirmationDialog(msg, p.sessionState),
+		Model:            dialog.NewToolConfirmationDialog(msg, p.sessionState),
+		OriginatingEvent: msg,
 	})
 	return tea.Batch(toolCmd, p.messages.ScrollToBottom(), spinnerCmd, dialogCmd)
 }
@@ -320,7 +325,8 @@ func (p *chatPage) handleToolCallResponse(msg *runtime.ToolCallResponseEvent) te
 func (p *chatPage) handleMaxIterationsReached(msg *runtime.MaxIterationsReachedEvent) tea.Cmd {
 	spinnerCmd := p.setWorking(false)
 	dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-		Model: dialog.NewMaxIterationsDialog(msg.MaxIterations, p.app),
+		Model:            dialog.NewMaxIterationsDialog(msg.MaxIterations, p.app),
+		OriginatingEvent: msg,
 	})
 	return tea.Batch(spinnerCmd, dialogCmd)
 }
@@ -331,14 +337,15 @@ func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent
 	// Check if this is an OAuth flow by looking at the meta type
 	// Guard against nil Meta map to prevent panic
 	if msg.Meta != nil {
-		if elicitationType, ok := msg.Meta["cagent/type"].(string); ok && elicitationType == "oauth_flow" {
+		if elicitationType, ok := msg.Meta["docker-agent/type"].(string); ok && elicitationType == "oauth_flow" {
 			// OAuth flow - show the OAuth authorization dialog
 			var serverURL string
-			if url, ok := msg.Meta["cagent/server_url"].(string); ok {
+			if url, ok := msg.Meta["docker-agent/server_url"].(string); ok {
 				serverURL = url
 			}
 			dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-				Model: dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
+				Model:            dialog.NewOAuthAuthorizationDialog(serverURL, p.app),
+				OriginatingEvent: msg,
 			})
 			return tea.Batch(spinnerCmd, dialogCmd)
 		}
@@ -349,15 +356,30 @@ func (p *chatPage) handleElicitationRequest(msg *runtime.ElicitationRequestEvent
 	case "url":
 		// URL-based elicitation - show URL dialog
 		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewURLElicitationDialog(msg.Message, msg.URL),
+			Model:            dialog.NewURLElicitationDialog(msg.Message, msg.URL),
+			OriginatingEvent: msg,
 		})
 		return tea.Batch(spinnerCmd, dialogCmd)
 
 	default:
 		// Form-based elicitation (default) - show form dialog
 		dialogCmd := core.CmdHandler(dialog.OpenDialogMsg{
-			Model: dialog.NewElicitationDialog(msg.Message, msg.Schema, msg.Meta),
+			Model:            dialog.NewElicitationDialog(msg.Message, msg.Schema, msg.Meta),
+			OriginatingEvent: msg,
 		})
 		return tea.Batch(spinnerCmd, dialogCmd)
+	}
+}
+
+// isSuccessfulStop returns true when the stream reason indicates a
+// normal completion that warrants the success sound. Empty reason
+// (e.g. cache hits, early exits before a turn runs) is treated as
+// success to preserve backward compatibility.
+func isSuccessfulStop(reason string) bool {
+	switch reason {
+	case "", "normal", "continue", "steered":
+		return true
+	default:
+		return false
 	}
 }

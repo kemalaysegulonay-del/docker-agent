@@ -5,24 +5,27 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/docker/portcullis"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/docker/docker-agent/pkg/internal/portcullistest"
 )
 
 func TestNew(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
-	assert.Equal(t, -1, h.current)
+	assert.Equal(t, 0, h.current)
 	assert.Empty(t, h.Messages)
 }
 
 func TestHistory_AddAndSave(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	messages := []string{"first", "second", "third"}
@@ -34,7 +37,7 @@ func TestHistory_AddAndSave(t *testing.T) {
 	assert.Equal(t, messages, h.Messages)
 	assert.Len(t, messages, h.current)
 
-	h2, err := New()
+	h2, err := New("")
 	require.NoError(t, err)
 	assert.Equal(t, messages, h2.Messages)
 }
@@ -42,7 +45,7 @@ func TestHistory_AddAndSave(t *testing.T) {
 func TestHistory_Navigation(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	assert.Empty(t, h.Previous())
@@ -66,7 +69,7 @@ func TestHistory_Navigation(t *testing.T) {
 func TestHistory_EdgeCases(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	assert.Empty(t, h.Previous())
@@ -82,7 +85,7 @@ func TestHistory_EdgeCases(t *testing.T) {
 func TestHistory_StayAtTheBeginning(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	require.NoError(t, h.Add("first"))
@@ -94,7 +97,7 @@ func TestHistory_StayAtTheBeginning(t *testing.T) {
 func TestHistory_NoDuplicateMessages(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	require.NoError(t, h.Add("first"))
@@ -109,7 +112,7 @@ func TestHistory_NoDuplicateMessages(t *testing.T) {
 func TestHistory_MoveDuplicateLast(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 
-	h, err := New()
+	h, err := New("")
 	require.NoError(t, err)
 
 	require.NoError(t, h.Add("first"))
@@ -126,13 +129,13 @@ func TestHistory_MoveDuplicateLast(t *testing.T) {
 func TestHistory_MultilineMessage(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	h, err := New(WithBaseDir(tmpDir))
+	h, err := New(tmpDir)
 	require.NoError(t, err)
 
 	multiline := "line1\nline2\nline3"
 	require.NoError(t, h.Add(multiline))
 
-	h2, err := New(WithBaseDir(tmpDir))
+	h2, err := New(tmpDir)
 	require.NoError(t, err)
 
 	require.Len(t, h2.Messages, 1)
@@ -148,7 +151,7 @@ func TestHistory_MigrateOldFormat(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(oldHistFile, []byte(`{"messages":["old1","old2","old3"]}`), 0o644))
 
-	h, err := New(WithBaseDir(tmpDir))
+	h, err := New(tmpDir)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"old1", "old2", "old3"}, h.Messages)
 
@@ -162,7 +165,7 @@ func TestHistory_MigrateOldFormat(t *testing.T) {
 func TestHistory_LatestMatch(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	h, err := New(WithBaseDir(tmpDir))
+	h, err := New(tmpDir)
 	require.NoError(t, err)
 
 	// Empty history returns empty string
@@ -194,7 +197,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("empty history", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		msg, idx, ok := h.FindPrevContains("test", len(h.Messages))
@@ -206,7 +209,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("empty query matches latest", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("first"))
@@ -222,7 +225,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("substring match", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("deploy staging"))
@@ -238,7 +241,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("case insensitive match", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("Deploy Staging"))
@@ -253,7 +256,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("cycling through matches", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("deploy v1"))
@@ -288,7 +291,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("no match", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("hello"))
@@ -303,7 +306,7 @@ func TestHistory_FindPrevContains(t *testing.T) {
 	t.Run("from out of bounds", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("hello"))
@@ -321,7 +324,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 	t.Run("basic forward search", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("deploy v1"))
@@ -337,7 +340,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 	t.Run("sequential forward search", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("echo 1"))
@@ -366,7 +369,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 	t.Run("no match", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("hello"))
@@ -380,7 +383,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 	t.Run("empty history", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		_, _, ok := h.FindNextContains("test", -1)
@@ -390,7 +393,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 	t.Run("case insensitive", func(t *testing.T) {
 		t.Parallel()
 		tmpDir := t.TempDir()
-		h, err := New(WithBaseDir(tmpDir))
+		h, err := New(tmpDir)
 		require.NoError(t, err)
 
 		require.NoError(t, h.Add("Deploy Staging"))
@@ -404,7 +407,7 @@ func TestHistory_FindNextContains(t *testing.T) {
 func TestHistory_SetCurrent(t *testing.T) {
 	t.Parallel()
 	tmpDir := t.TempDir()
-	h, err := New(WithBaseDir(tmpDir))
+	h, err := New(tmpDir)
 	require.NoError(t, err)
 
 	require.NoError(t, h.Add("first"))
@@ -418,10 +421,40 @@ func TestHistory_SetCurrent(t *testing.T) {
 	assert.Empty(t, h.Next())
 }
 
+func TestHistory_SetCurrentOutOfRange(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	h, err := New(tmpDir)
+	require.NoError(t, err)
+
+	require.NoError(t, h.Add("first"))
+	require.NoError(t, h.Add("second"))
+
+	// A negative value clamps to 0; Previous returns the oldest entry.
+	h.SetCurrent(-5)
+	assert.Equal(t, "first", h.Previous())
+
+	// A value past the end clamps to len(Messages); Next returns empty.
+	h.SetCurrent(100)
+	assert.Empty(t, h.Next())
+
+	// And from the clamped position, Previous returns the latest entry.
+	h.SetCurrent(100)
+	assert.Equal(t, "second", h.Previous())
+
+	// On empty history, SetCurrent never causes a panic.
+	empty, err := New(t.TempDir())
+	require.NoError(t, err)
+	empty.SetCurrent(-5)
+	assert.Empty(t, empty.Previous())
+	empty.SetCurrent(100)
+	assert.Empty(t, empty.Next())
+}
+
 func TestHistory_VeryLongMessage(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	h, err := New(WithBaseDir(tmpDir))
+	h, err := New(tmpDir)
 	require.NoError(t, err)
 
 	// Create a message longer than bufio.Scanner's default 64KB limit
@@ -435,10 +468,69 @@ func TestHistory_VeryLongMessage(t *testing.T) {
 	require.NoError(t, h.Add("short message after"))
 
 	// Reload history from disk
-	h2, err := New(WithBaseDir(tmpDir))
+	h2, err := New(tmpDir)
 	require.NoError(t, err)
 
 	require.Len(t, h2.Messages, 2)
 	assert.Equal(t, longStr, h2.Messages[0])
 	assert.Equal(t, "short message after", h2.Messages[1])
+}
+
+func TestHistory_RedactsOnAdd(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	h, err := New(tmpDir)
+	require.NoError(t, err)
+
+	pat := portcullistest.FakeGitHubPAT("cxLeRrvbJfmYdUtr70xnNE3Q7Gvli4")
+	msg := "deploy with token " + pat
+	require.NoError(t, h.Add(msg))
+
+	require.Len(t, h.Messages, 1)
+	stored := h.Messages[0]
+	assert.NotContains(t, stored, pat, "in-memory history must not contain the secret")
+	assert.Contains(t, stored, portcullis.Marker)
+
+	// On-disk file must also be redacted.
+	data, err := os.ReadFile(filepath.Join(tmpDir, ".cagent", "history"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), pat, "persisted history must not contain the secret")
+	assert.Contains(t, string(data), portcullis.Marker)
+}
+
+func TestHistory_RedactsOnLoad(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".cagent"), 0o700))
+	histFile := filepath.Join(tmpDir, ".cagent", "history")
+
+	pat := portcullistest.FakeGitHubPAT("cxLeRrvbJfmYdUtr70xnNE3Q7Gvli4")
+	// Simulate a pre-existing history file written before redaction was wired in.
+	require.NoError(t, os.WriteFile(histFile, []byte(`"deploy with token `+pat+"\"\n"), 0o600))
+
+	h, err := New(tmpDir)
+	require.NoError(t, err)
+
+	require.Len(t, h.Messages, 1)
+	assert.NotContains(t, h.Messages[0], pat, "loaded history must not expose the secret in memory")
+	assert.Contains(t, h.Messages[0], portcullis.Marker)
+}
+
+func TestHistory_RedactsOnMigrate(t *testing.T) {
+	tmpDir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(tmpDir, ".cagent"), 0o700))
+	oldHistFile := filepath.Join(tmpDir, ".cagent", "history.json")
+
+	pat := portcullistest.FakeGitHubPAT("cxLeRrvbJfmYdUtr70xnNE3Q7Gvli4")
+	require.NoError(t, os.WriteFile(oldHistFile, []byte(`{"messages":["leak `+pat+`"]}`), 0o600))
+
+	h, err := New(tmpDir)
+	require.NoError(t, err)
+
+	require.Len(t, h.Messages, 1)
+	assert.NotContains(t, h.Messages[0], pat, "migrated history must not expose the secret")
+	assert.Contains(t, h.Messages[0], portcullis.Marker)
+
+	data, err := os.ReadFile(filepath.Join(tmpDir, ".cagent", "history"))
+	require.NoError(t, err)
+	assert.NotContains(t, string(data), pat, "migrated on-disk history must not contain the secret")
 }

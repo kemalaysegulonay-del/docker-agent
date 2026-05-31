@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"time"
 
 	"github.com/mattn/go-isatty"
@@ -19,12 +19,14 @@ import (
 	"github.com/docker/docker-agent/pkg/app"
 	"github.com/docker/docker-agent/pkg/cli"
 	"github.com/docker/docker-agent/pkg/config"
+	latestcfg "github.com/docker/docker-agent/pkg/config/latest"
+	"github.com/docker/docker-agent/pkg/hooks"
+	"github.com/docker/docker-agent/pkg/hooks/builtins"
 	"github.com/docker/docker-agent/pkg/paths"
 	"github.com/docker/docker-agent/pkg/permissions"
 	"github.com/docker/docker-agent/pkg/profiling"
 	"github.com/docker/docker-agent/pkg/runtime"
 	"github.com/docker/docker-agent/pkg/session"
-	"github.com/docker/docker-agent/pkg/sessiontitle"
 	"github.com/docker/docker-agent/pkg/teamloader"
 	"github.com/docker/docker-agent/pkg/telemetry"
 	"github.com/docker/docker-agent/pkg/tui"
@@ -53,6 +55,7 @@ type runExecFlags struct {
 	sandbox           bool
 	sandboxTemplate   string
 	sbx               bool
+	noKit             bool
 
 	// Exec only
 	exec          bool
@@ -60,12 +63,29 @@ type runExecFlags struct {
 	outputJSON    bool
 
 	// Run only
-	hideToolResults bool
-	lean            bool
+	hideToolResults  bool
+	lean             bool
+	appName          string
+	sidebar          bool
+	listenAddr       string
+	onEventSpecs     []string
+	disabledCommands []string
+	theme            string
 
 	// globalPermissions holds the user-level global permission checker built
 	// from user config settings. Nil when no global permissions are configured.
 	globalPermissions *permissions.Checker
+	snapshotsEnabled  bool
+
+	// snapshotController is the [builtins.SnapshotController] for the
+	// initial App: it is wired into the initial runtime as an
+	// auto-injector and into the App via app.WithSnapshotController so
+	// /undo, /snapshots, /reset drive the same instance that captures
+	// the checkpoints. Sub-runtimes created by [createSessionSpawner]
+	// build their own controller (and registry) so each spawned
+	// session has independent snapshot state; that controller is local
+	// to the spawner closure and never reaches this field.
+	snapshotController builtins.SnapshotController
 }
 
 func newRunCmd() *cobra.Command {
@@ -96,7 +116,7 @@ func newRunCmd() *cobra.Command {
 }
 
 func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
-	cmd.PersistentFlags().StringVarP(&flags.agentName, "agent", "a", "root", "Name of the agent to run")
+	cmd.PersistentFlags().StringVarP(&flags.agentName, "agent", "a", "", "Name of the agent to run (defaults to the team's first agent)")
 	cmd.PersistentFlags().BoolVar(&flags.autoApprove, "yolo", false, "Automatically approve all tool calls without prompting")
 	cmd.PersistentFlags().BoolVar(&flags.hideToolResults, "hide-tool-results", false, "Hide tool call results")
 	cmd.PersistentFlags().StringVar(&flags.attachmentPath, "attach", "", "Attach an image file to the message")
@@ -113,6 +133,9 @@ func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
 	cmd.PersistentFlags().Lookup("record").NoOptDefVal = "true"
 	cmd.PersistentFlags().BoolVar(&flags.exitAfterResponse, "exit-after-response", false, "Exit TUI after first assistant response completes")
 	_ = cmd.PersistentFlags().MarkHidden("exit-after-response")
+	cmd.PersistentFlags().StringVar(&flags.listenAddr, "listen", "", "Expose this run's control plane on the given address (e.g. 127.0.0.1:0)")
+	_ = cmd.PersistentFlags().MarkHidden("listen")
+	cmd.PersistentFlags().StringArrayVar(&flags.onEventSpecs, "on-event", nil, "Run shell command on event: --on-event <type>=<cmd> (or *=<cmd> for any). Repeatable.")
 	cmd.PersistentFlags().StringVar(&flags.cpuProfile, "cpuprofile", "", "Write CPU profile to file")
 	_ = cmd.PersistentFlags().MarkHidden("cpuprofile")
 	cmd.PersistentFlags().StringVar(&flags.memProfile, "memprofile", "", "Write memory profile to file")
@@ -120,10 +143,21 @@ func addRunOrExecFlags(cmd *cobra.Command, flags *runExecFlags) {
 	cmd.PersistentFlags().BoolVar(&flags.forceTUI, "force-tui", false, "Force TUI mode even when not in a terminal")
 	_ = cmd.PersistentFlags().MarkHidden("force-tui")
 	cmd.PersistentFlags().BoolVar(&flags.lean, "lean", false, "Use a simplified TUI with minimal chrome")
+	cmd.PersistentFlags().StringVar(&flags.appName, "app-name", "", "Application name shown in the TUI in place of \"docker agent\"")
+	cmd.PersistentFlags().StringSliceVar(&flags.disabledCommands, "disable-commands", nil, "Comma-separated list of slash commands to hide and disable in the TUI (e.g. /cost,/eval,/model)")
+	cmd.PersistentFlags().BoolVar(&flags.sidebar, "sidebar", true, "Show the sidebar in the TUI (set --sidebar=false to hide it)")
+	cmd.PersistentFlags().StringVar(&flags.theme, "theme", "", "Preselect a TUI theme by name (overrides the theme from user config; ignored outside the interactive TUI)")
+	_ = cmd.RegisterFlagCompletionFunc("theme", completeTheme)
 	cmd.PersistentFlags().BoolVar(&flags.sandbox, "sandbox", false, "Run the agent inside a Docker sandbox (requires Docker Desktop with sandbox support)")
 	cmd.PersistentFlags().StringVar(&flags.sandboxTemplate, "template", "docker/sandbox-templates:docker-agent", "Template image for the sandbox (passed to docker sandbox create -t)")
 	cmd.PersistentFlags().BoolVar(&flags.sbx, "sbx", true, "Prefer the sbx CLI backend when available (set --sbx=false to force docker sandbox)")
+	cmd.PersistentFlags().BoolVar(&flags.noKit, "no-kit", false, "Do not stage a docker-agent kit (skills, prompt files) when running in a sandbox")
 	cmd.MarkFlagsMutuallyExclusive("fake", "record")
+	cmd.MarkFlagsMutuallyExclusive("remote", "sandbox")
+	cmd.MarkFlagsMutuallyExclusive("remote", "session-db")
+	cmd.MarkFlagsMutuallyExclusive("remote", "session")
+	cmd.MarkFlagsMutuallyExclusive("remote", "record")
+	cmd.MarkFlagsMutuallyExclusive("remote", "fake")
 
 	// --exec only
 	cmd.PersistentFlags().BoolVar(&flags.exec, "exec", false, "Execute without a TUI")
@@ -146,8 +180,29 @@ func (f *runExecFlags) runRunCommand(cmd *cobra.Command, args []string) (command
 		}()
 	}
 
+	// Validate an explicit --theme value early so a typo fails fast with a
+	// helpful message instead of silently falling back to the default theme
+	// once the TUI starts.
+	if f.theme != "" {
+		if err := validateTheme(f.theme); err != nil {
+			return err
+		}
+	}
+
+	// Resolve alias / runtime-declared sandbox opt-in before dispatch.
+	// An explicit --sandbox=<bool> on the CLI always wins, so we only
+	// consult the lower-priority sources when the flag wasn't set.
+	var agentCfg *latestcfg.Config
+	if !cmd.Flags().Changed("sandbox") {
+		var agentRef string
+		if len(args) > 0 {
+			agentRef = args[0]
+		}
+		f.sandbox, agentCfg = resolveSandboxDefault(ctx, agentRef, f.sandbox)
+	}
+
 	if f.sandbox {
-		return runInSandbox(ctx, cmd, args, &f.runConfig, f.sandboxTemplate, f.sbx)
+		return runInSandbox(ctx, cmd, args, &f.runConfig, f.sandboxTemplate, f.sbx, f.noKit, agentCfg)
 	}
 
 	out := cli.NewPrinter(cmd.OutOrStdout())
@@ -157,7 +212,7 @@ func (f *runExecFlags) runRunCommand(cmd *cobra.Command, args []string) (command
 }
 
 func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []string, useTUI bool) error {
-	slog.Debug("Starting agent", "agent", f.agentName)
+	slog.DebugContext(ctx, "Starting agent", "agent", f.agentName)
 
 	// Start profiling if requested
 	stopProfiling, err := profiling.Start(f.cpuProfile, f.memProfile)
@@ -166,7 +221,7 @@ func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []s
 	}
 	defer func() {
 		if err := stopProfiling(); err != nil {
-			slog.Error("Profiling cleanup failed", "error", err)
+			slog.ErrorContext(ctx, "Profiling cleanup failed", "error", err)
 		}
 	}()
 
@@ -180,17 +235,21 @@ func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []s
 	userSettings := userconfig.Get()
 	if userSettings.HideToolResults && !f.hideToolResults {
 		f.hideToolResults = true
-		slog.Debug("Applying user settings", "hide_tool_results", true)
+		slog.DebugContext(ctx, "Applying user settings", "hide_tool_results", true)
 	}
 	if userSettings.YOLO && !f.autoApprove {
 		f.autoApprove = true
-		slog.Debug("Applying user settings", "YOLO", true)
+		slog.DebugContext(ctx, "Applying user settings", "YOLO", true)
+	}
+	if userSettings.SnapshotsEnabled() {
+		f.snapshotsEnabled = true
+		slog.DebugContext(ctx, "Applying user settings", "snapshot", true)
 	}
 
 	// Apply alias options if this is an alias reference
 	// Alias options only apply if the flag wasn't explicitly set by the user
 	if alias := config.ResolveAlias(agentFileName); alias != nil {
-		slog.Debug("Applying alias options", "yolo", alias.Yolo, "model", alias.Model, "hide_tool_results", alias.HideToolResults)
+		slog.DebugContext(ctx, "Applying alias options", "yolo", alias.Yolo, "model", alias.Model, "hide_tool_results", alias.HideToolResults, "sandbox", alias.Sandbox)
 		if alias.Yolo && !f.autoApprove {
 			f.autoApprove = true
 		}
@@ -200,6 +259,10 @@ func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []s
 		if alias.HideToolResults && !f.hideToolResults {
 			f.hideToolResults = true
 		}
+		// alias.Sandbox is consumed earlier in runRunCommand before
+		// dispatch; reaching runOrExec means the sandbox decision
+		// resolved to false (or the user opted out via --sandbox=false),
+		// so flipping it here would be a no-op.
 	}
 
 	// Build global permissions checker from user config settings.
@@ -214,7 +277,7 @@ func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []s
 	}
 	defer func() {
 		if err := fakeCleanup(); err != nil {
-			slog.Error("Failed to cleanup fake proxy", "error", err)
+			slog.ErrorContext(ctx, "Failed to cleanup fake proxy", "error", err)
 		}
 	}()
 
@@ -226,155 +289,161 @@ func (f *runExecFlags) runOrExec(ctx context.Context, out *cli.Printer, args []s
 	if cassettePath != "" {
 		defer func() {
 			if err := recordCleanup(); err != nil {
-				slog.Error("Failed to cleanup recording proxy", "error", err)
+				slog.ErrorContext(ctx, "Failed to cleanup recording proxy", "error", err)
 			}
 		}()
 		out.Println("Recording mode enabled, cassette: " + cassettePath)
 	}
 
-	// Remote runtime
-	if f.remoteAddress != "" {
-		rt, sess, err := f.createRemoteRuntimeAndSession(ctx, agentFileName)
-		if err != nil {
-			return err
-		}
-		return f.launchTUI(ctx, out, rt, sess, args, useTUI)
-	}
-
-	// Local runtime
-	agentSource, err := config.Resolve(agentFileName, f.runConfig.EnvProvider())
-	if err != nil {
-		return err
-	}
-
-	loadResult, err := f.loadAgentFrom(ctx, agentSource)
-	if err != nil {
-		return err
-	}
-
-	rt, sess, err := f.createLocalRuntimeAndSession(ctx, loadResult)
+	b, err := f.selectBackend(agentFileName)
 	if err != nil {
 		return err
 	}
 	defer func() {
-		if err := rt.Close(); err != nil {
-			slog.Error("Failed to close runtime", "error", err)
+		if err := b.Close(); err != nil {
+			slog.ErrorContext(ctx, "Failed to close backend", "error", err)
 		}
 	}()
-	var initialTeamCleanupOnce sync.Once
-	initialTeamCleanup := func() {
-		initialTeamCleanupOnce.Do(func() {
-			stopToolSets(loadResult.Team)
-		})
+
+	loadResult, err := b.LoadTeam(ctx, b.LoadTeamRequest())
+	if err != nil {
+		return err
 	}
-	defer initialTeamCleanup()
 
 	if f.dryRun {
+		if loadResult != nil {
+			stopToolSets(loadResult.Team)
+		}
 		out.Println("Dry run mode enabled. Agent initialized but will not execute.")
 		return nil
 	}
+
+	wd, _ := os.Getwd()
+	rt, sess, cleanup, err := b.CreateSession(ctx, loadResult, b.CreateSessionRequest(wd))
+	if err != nil {
+		return err
+	}
+	defer cleanup()
 
 	if !useTUI {
 		return f.handleExecMode(ctx, out, rt, sess, args)
 	}
 
-	applyTheme()
-	opts, err := f.buildAppOpts(args)
+	listenOpt, err := f.startAttachedServer(ctx, out, rt, sess)
 	if err != nil {
 		return err
 	}
 
-	sessStore := rt.SessionStore()
-	return runTUI(ctx, rt, sess, f.createSessionSpawner(agentSource, sessStore), initialTeamCleanup, f.tuiOpts(), opts...)
+	applyTheme(f.theme)
+	opts, err := f.buildAppOpts(args)
+	if err != nil {
+		return err
+	}
+	if listenOpt != nil {
+		opts = append(opts, listenOpt)
+	}
+
+	eventHooks, err := parseOnEventFlags(f.onEventSpecs)
+	if err != nil {
+		return err
+	}
+	if hookOpt := withEventHooks(eventHooks); hookOpt != nil {
+		opts = append(opts, hookOpt)
+	}
+
+	return runTUI(ctx, rt, sess, b.Spawner(rt), cleanup, f.tuiOpts(), opts...)
 }
 
-func (f *runExecFlags) loadAgentFrom(ctx context.Context, agentSource config.Source) (*teamloader.LoadResult, error) {
+func (f *runExecFlags) loadAgentFrom(ctx context.Context, req runtime.LoadTeamRequest) (*teamloader.LoadResult, error) {
 	opts := []teamloader.Opt{
-		teamloader.WithModelOverrides(f.modelOverrides),
+		teamloader.WithModelOverrides(req.ModelOverrides),
 	}
-	if len(f.promptFiles) > 0 {
-		opts = append(opts, teamloader.WithPromptFiles(f.promptFiles))
+	if len(req.PromptFiles) > 0 {
+		opts = append(opts, teamloader.WithPromptFiles(req.PromptFiles))
 	}
-	return teamloader.LoadWithConfig(ctx, agentSource, &f.runConfig, opts...)
+	return teamloader.LoadWithConfig(ctx, req.Source, req.RunConfig, opts...)
 }
 
-func (f *runExecFlags) createRemoteRuntimeAndSession(ctx context.Context, originalFilename string) (runtime.Runtime, *session.Session, error) {
-	client, err := runtime.NewClient(f.remoteAddress)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create remote client: %w", err)
+// runtimeOpts returns the runtime options derived from the current flags,
+// the loaded team and the runtime configuration. The session store and the
+// current agent name are passed in because they're resolved by callers from
+// different sources (e.g. the spawner uses the same store as the parent).
+func (f *runExecFlags) runtimeOpts(loadResult *teamloader.LoadResult, runConfig *config.RuntimeConfig, sessStore session.Store, agentName string) []runtime.Opt {
+	modelSwitcherCfg := &runtime.ModelSwitcherConfig{
+		Models:             loadResult.Models,
+		Providers:          loadResult.Providers,
+		ModelsGateway:      runConfig.ModelsGateway,
+		EnvProvider:        runConfig.EnvProvider(),
+		AgentDefaultModels: loadResult.AgentDefaultModels,
 	}
-
-	sessTemplate := session.New(
-		session.WithToolsApproved(f.autoApprove),
-	)
-
-	sess, err := client.CreateSession(ctx, sessTemplate)
-	if err != nil {
-		return nil, nil, err
+	opts := []runtime.Opt{
+		runtime.WithSessionStore(sessStore),
+		runtime.WithCurrentAgent(agentName),
+		runtime.WithWorkingDir(runConfig.WorkingDir),
+		runtime.WithTracer(otel.Tracer(AppName)),
+		runtime.WithModelSwitcherConfig(modelSwitcherCfg),
 	}
-
-	remoteRt, err := runtime.NewRemoteRuntime(client,
-		runtime.WithRemoteCurrentAgent(f.agentName),
-		runtime.WithRemoteAgentFilename(originalFilename),
-	)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create remote runtime: %w", err)
-	}
-
-	slog.Debug("Using remote runtime", "address", f.remoteAddress, "agent", f.agentName)
-	return remoteRt, sess, nil
+	return opts
 }
 
-func (f *runExecFlags) createLocalRuntimeAndSession(ctx context.Context, loadResult *teamloader.LoadResult) (runtime.Runtime, *session.Session, error) {
+// snapshotRuntimeOpts wires the snapshot builtin into a runtime.
+// Returns the [runtime.Opt]s that hand the registry and the
+// [builtins.SnapshotController] auto-injector to the runtime, plus
+// the controller itself for the embedder to pass to the App via
+// [app.WithSnapshotController]. When snapshots aren't enabled,
+// returns no opts and a nil controller so callers don't have to
+// branch on f.snapshotsEnabled themselves.
+//
+// A fresh registry is created here rather than reused across runtimes
+// so the spawner-created sub-runtimes get their own snapshot state
+// (each spawned session has independent /undo history).
+func (f *runExecFlags) snapshotRuntimeOpts() ([]runtime.Opt, builtins.SnapshotController, error) {
+	if !f.snapshotsEnabled {
+		return nil, nil, nil
+	}
+	reg := hooks.NewRegistry()
+	ctrl, err := builtins.RegisterSnapshot(reg, true)
+	if err != nil {
+		return nil, nil, fmt.Errorf("register snapshot builtin: %w", err)
+	}
+	return []runtime.Opt{
+		runtime.WithHooksRegistry(reg),
+		runtime.WithAutoInjector(ctrl),
+	}, ctrl, nil
+}
+
+func (f *runExecFlags) createLocalRuntimeAndSession(ctx context.Context, loadResult *teamloader.LoadResult, req runtime.CreateSessionRequest, sessStore session.Store) (runtime.Runtime, *session.Session, error) {
 	t := loadResult.Team
 
 	// Merge user-level global permissions into the team's checker so the
 	// runtime receives a single, already-merged permission set.
-	if f.globalPermissions != nil && !f.globalPermissions.IsEmpty() {
-		t.SetPermissions(permissions.Merge(t.Permissions(), f.globalPermissions))
+	if req.GlobalPermissions != nil && !req.GlobalPermissions.IsEmpty() {
+		t.SetPermissions(permissions.Merge(t.Permissions(), req.GlobalPermissions))
 	}
 
-	agt, err := t.Agent(f.agentName)
+	agt, err := t.AgentOrDefault(req.AgentName)
 	if err != nil {
 		return nil, nil, err
 	}
+	agentName := agt.Name()
 
-	// Expand tilde in session database path
-	sessionDB, err := expandTilde(f.sessionDB)
+	rtOpts, ctrl, err := f.snapshotRuntimeOpts()
 	if err != nil {
 		return nil, nil, err
 	}
-
-	sessStore, err := session.NewSQLiteSessionStore(sessionDB)
-	if err != nil {
-		return nil, nil, fmt.Errorf("creating session store: %w", err)
-	}
-
-	// Create model switcher config for runtime model switching support
-	modelSwitcherCfg := &runtime.ModelSwitcherConfig{
-		Models:             loadResult.Models,
-		Providers:          loadResult.Providers,
-		ModelsGateway:      f.runConfig.ModelsGateway,
-		EnvProvider:        f.runConfig.EnvProvider(),
-		AgentDefaultModels: loadResult.AgentDefaultModels,
-	}
-
-	localRt, err := runtime.New(t,
-		runtime.WithSessionStore(sessStore),
-		runtime.WithCurrentAgent(f.agentName),
-		runtime.WithTracer(otel.Tracer(AppName)),
-		runtime.WithModelSwitcherConfig(modelSwitcherCfg),
-	)
+	runtimeOpts := append(f.runtimeOpts(loadResult, &f.runConfig, sessStore, agentName), rtOpts...)
+	localRt, err := runtime.New(t, runtimeOpts...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("creating runtime: %w", err)
 	}
+	f.snapshotController = ctrl
 
 	var sess *session.Session
-	if f.sessionID != "" {
+	if req.ResumeSessionID != "" {
 		// Resolve relative session references (e.g., "-1" for last session)
-		resolvedID, err := session.ResolveSessionID(ctx, sessStore, f.sessionID)
+		resolvedID, err := session.ResolveSessionID(ctx, sessStore, req.ResumeSessionID)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolving session %q: %w", f.sessionID, err)
+			return nil, nil, fmt.Errorf("resolving session %q: %w", req.ResumeSessionID, err)
 		}
 
 		// Load existing session
@@ -382,27 +451,24 @@ func (f *runExecFlags) createLocalRuntimeAndSession(ctx context.Context, loadRes
 		if err != nil {
 			return nil, nil, fmt.Errorf("loading session %q: %w", resolvedID, err)
 		}
-		sess.ToolsApproved = f.autoApprove
-		sess.HideToolResults = f.hideToolResults
+		sess.ToolsApproved = req.ToolsApproved
+		sess.HideToolResults = req.HideToolResults
 
 		// Apply any stored model overrides from the session
-		if len(sess.AgentModelOverrides) > 0 {
-			if modelSwitcher, ok := localRt.(runtime.ModelSwitcher); ok {
-				for agentName, modelRef := range sess.AgentModelOverrides {
-					if err := modelSwitcher.SetAgentModel(ctx, agentName, modelRef); err != nil {
-						slog.Warn("Failed to apply stored model override", "agent", agentName, "model", modelRef, "error", err)
-					}
+		if len(sess.AgentModelOverrides) > 0 && localRt.SupportsModelSwitching() {
+			for agentName, modelRef := range sess.AgentModelOverrides {
+				if err := localRt.SetAgentModel(ctx, agentName, modelRef); err != nil {
+					slog.WarnContext(ctx, "Failed to apply stored model override", "agent", agentName, "model", modelRef, "error", err)
 				}
 			}
 		}
 
-		slog.Debug("Loaded existing session", "session_id", resolvedID, "session_ref", f.sessionID, "agent", f.agentName)
+		slog.DebugContext(ctx, "Loaded existing session", "session_id", resolvedID, "session_ref", req.ResumeSessionID, "agent", agentName)
 	} else {
-		wd, _ := os.Getwd()
-		sess = session.New(f.buildSessionOpts(agt, wd)...)
+		sess = session.New(f.buildSessionOpts(agt, req)...)
 		// Session is stored lazily on first UpdateSession call (when content is added)
 		// This avoids creating empty sessions in the database
-		slog.Debug("Using local runtime", "agent", f.agentName)
+		slog.DebugContext(ctx, "Using local runtime", "agent", agentName)
 	}
 
 	return localRt, sess, nil
@@ -445,33 +511,20 @@ func readInitialMessage(args []string) (*string, error) {
 	return &args[1], nil
 }
 
-func (f *runExecFlags) launchTUI(ctx context.Context, out *cli.Printer, rt runtime.Runtime, sess *session.Session, args []string, useTUI bool) error {
-	if useTUI {
-		applyTheme()
-	}
-
-	if f.dryRun {
-		out.Println("Dry run mode enabled. Agent initialized but will not execute.")
-		return nil
-	}
-
-	if !useTUI {
-		return f.handleExecMode(ctx, out, rt, sess, args)
-	}
-
-	opts, err := f.buildAppOpts(args)
-	if err != nil {
-		return err
-	}
-
-	return runTUI(ctx, rt, sess, nil, nil, f.tuiOpts(), opts...)
-}
-
 // tuiOpts returns the TUI options derived from the current flags.
 func (f *runExecFlags) tuiOpts() []tui.Option {
 	var opts []tui.Option
 	if f.lean {
 		opts = append(opts, tui.WithLeanMode())
+	}
+	if f.appName != "" {
+		opts = append(opts, tui.WithAppName(f.appName))
+	}
+	if len(f.disabledCommands) > 0 {
+		opts = append(opts, tui.WithDisabledCommands(f.disabledCommands))
+	}
+	if !f.sidebar {
+		opts = append(opts, tui.WithHideSidebar())
 	}
 	return opts
 }
@@ -500,20 +553,23 @@ func (f *runExecFlags) buildAppOpts(args []string) ([]app.Opt, error) {
 	if f.exitAfterResponse {
 		opts = append(opts, app.WithExitAfterFirstResponse())
 	}
+	if f.snapshotController != nil {
+		opts = append(opts, app.WithSnapshotController(f.snapshotController))
+	}
 	return opts, nil
 }
 
 // buildSessionOpts returns the canonical set of session options derived from
 // CLI flags and agent configuration. Both the initial session and spawned
 // sessions use this method so their options never drift apart.
-func (f *runExecFlags) buildSessionOpts(agt *agent.Agent, workingDir string) []session.Opt {
+func (f *runExecFlags) buildSessionOpts(agt *agent.Agent, req runtime.CreateSessionRequest) []session.Opt {
 	return []session.Opt{
 		session.WithMaxIterations(agt.MaxIterations()),
 		session.WithMaxConsecutiveToolCalls(agt.MaxConsecutiveToolCalls()),
 		session.WithMaxOldToolCallTokens(agt.MaxOldToolCallTokens()),
-		session.WithToolsApproved(f.autoApprove),
-		session.WithHideToolResults(f.hideToolResults),
-		session.WithWorkingDir(workingDir),
+		session.WithToolsApproved(req.ToolsApproved),
+		session.WithHideToolResults(req.HideToolResults),
+		session.WithWorkingDir(req.WorkingDir),
 	}
 }
 
@@ -524,57 +580,53 @@ func (f *runExecFlags) createSessionSpawner(agentSource config.Source, sessStore
 		runConfigCopy := f.runConfig.Clone()
 		runConfigCopy.WorkingDir = workingDir
 
-		// Load team with the new working directory
-		loadResult, err := teamloader.LoadWithConfig(spawnCtx, agentSource, runConfigCopy, teamloader.WithModelOverrides(f.modelOverrides))
+		// Load team with the new working directory, honouring every flag the
+		// initial load already honours (model overrides AND prompt files).
+		loadReq := f.loadTeamRequest(agentSource)
+		loadReq.RunConfig = runConfigCopy
+		loadResult, err := f.loadAgentFrom(spawnCtx, loadReq)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 
-		team := loadResult.Team
-		agt, err := team.Agent(f.agentName)
+		t := loadResult.Team
+		agt, err := t.AgentOrDefault(f.agentName)
 		if err != nil {
 			return nil, nil, nil, err
-		}
-
-		// Create model switcher config
-		modelSwitcherCfg := &runtime.ModelSwitcherConfig{
-			Models:             loadResult.Models,
-			Providers:          loadResult.Providers,
-			ModelsGateway:      runConfigCopy.ModelsGateway,
-			EnvProvider:        runConfigCopy.EnvProvider(),
-			AgentDefaultModels: loadResult.AgentDefaultModels,
 		}
 
 		// Merge global permissions into the team's checker
 		if f.globalPermissions != nil && !f.globalPermissions.IsEmpty() {
-			team.SetPermissions(permissions.Merge(team.Permissions(), f.globalPermissions))
+			t.SetPermissions(permissions.Merge(t.Permissions(), f.globalPermissions))
 		}
 
-		// Create the local runtime
-		localRt, err := runtime.New(team,
-			runtime.WithSessionStore(sessStore),
-			runtime.WithCurrentAgent(f.agentName),
-			runtime.WithTracer(otel.Tracer(AppName)),
-			runtime.WithModelSwitcherConfig(modelSwitcherCfg),
-		)
+		rtOpts, ctrl, err := f.snapshotRuntimeOpts()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		runtimeOpts := append(f.runtimeOpts(loadResult, runConfigCopy, sessStore, agt.Name()), rtOpts...)
+		localRt, err := runtime.New(t, runtimeOpts...)
 		if err != nil {
 			return nil, nil, nil, err
 		}
 
 		// Create a new session
-		newSess := session.New(f.buildSessionOpts(agt, workingDir)...)
+		spawnReq := f.createSessionRequest(workingDir)
+		spawnReq.AgentName = agt.Name()
+		newSess := session.New(f.buildSessionOpts(agt, spawnReq)...)
 
 		// Create cleanup function
 		cleanup := func() {
-			stopToolSets(team)
+			stopToolSets(t)
 		}
 
 		// Create the app
 		var appOpts []app.Opt
-		if pr, ok := localRt.(*runtime.PersistentRuntime); ok {
-			if model := pr.CurrentAgent().Model(); model != nil {
-				appOpts = append(appOpts, app.WithTitleGenerator(sessiontitle.New(model)))
-			}
+		if gen := localRt.TitleGenerator(); gen != nil {
+			appOpts = append(appOpts, app.WithTitleGenerator(gen))
+		}
+		if ctrl != nil {
+			appOpts = append(appOpts, app.WithSnapshotController(ctrl))
 		}
 
 		a := app.New(spawnCtx, localRt, newSess, appOpts...)
@@ -594,16 +646,33 @@ func stopToolSets(t toolStopper) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := t.StopToolSets(ctx); err != nil {
-		slog.Error("Failed to stop tool sets", "error", err)
+		slog.ErrorContext(ctx, "Failed to stop tool sets", "error", err)
 	}
 }
 
-// applyTheme applies the theme from user config, or the built-in default.
-func applyTheme() {
-	// Resolve theme from user config > built-in default
+// validateTheme reports whether ref names a loadable theme. It is used to
+// fail fast on an explicit --theme value, listing the available themes so the
+// user can correct a typo.
+func validateTheme(ref string) error {
+	if _, err := styles.LoadTheme(ref); err != nil {
+		if refs, listErr := styles.ListThemeRefs(); listErr == nil && len(refs) > 0 {
+			return fmt.Errorf("unknown theme %q; available themes: %s", ref, strings.Join(refs, ", "))
+		}
+		return fmt.Errorf("unknown theme %q: %w", ref, err)
+	}
+	return nil
+}
+
+// applyTheme applies the theme, resolving it from the --theme flag, then the
+// user config, then the built-in default.
+func applyTheme(themeOverride string) {
+	// Resolve theme from --theme flag > user config > built-in default
 	themeRef := styles.DefaultThemeRef
 	if userSettings := userconfig.Get(); userSettings.Theme != "" {
 		themeRef = userSettings.Theme
+	}
+	if themeOverride != "" {
+		themeRef = themeOverride
 	}
 
 	theme, err := styles.LoadTheme(themeRef)

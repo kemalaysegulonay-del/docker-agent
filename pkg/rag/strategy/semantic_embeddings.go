@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/js"
 	"github.com/docker/docker-agent/pkg/model/provider"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/rag/chunk"
 	"github.com/docker/docker-agent/pkg/rag/types"
 	"github.com/docker/docker-agent/pkg/tools"
@@ -94,8 +95,8 @@ func NewSemanticEmbeddingsFromConfig(ctx context.Context, cfg latest.RAGStrategy
 	}
 
 	chatModelID := chatProvider.ID()
-	if chatModelID == "" && chatModelCfg.Provider != "" && chatModelCfg.Model != "" {
-		chatModelID = fmt.Sprintf("%s/%s", chatModelCfg.Provider, chatModelCfg.Model)
+	if chatModelID.IsZero() && chatModelCfg.Provider != "" && chatModelCfg.Model != "" {
+		chatModelID = modelsdev.NewID(chatModelCfg.Provider, chatModelCfg.Model)
 	}
 
 	// Get optional parameters with defaults
@@ -113,7 +114,7 @@ func NewSemanticEmbeddingsFromConfig(ctx context.Context, cfg latest.RAGStrategy
 	semanticPrompt := GetParam(cfg.Params, "semantic_prompt", defaultSemanticPrompt())
 	useASTContext := GetParam(cfg.Params, "ast_context", false)
 	if useASTContext && !cfg.Chunking.CodeAware {
-		slog.Warn("semantic-embeddings ast_context is enabled but chunking.code_aware is false; AST metadata may be unavailable",
+		slog.WarnContext(ctx, "semantic-embeddings ast_context is enabled but chunking.code_aware is false; AST metadata may be unavailable",
 			"rag", buildCtx.RAGName)
 	}
 
@@ -304,15 +305,15 @@ func (b *llmSemanticEmbeddingBuilder) BuildEmbeddingInput(ctx context.Context, s
 
 	if summary == "" {
 		// If the semantic model returns no content, fall back to truncated chunk
-		slog.Warn("Semantic model returned empty summary; falling back to truncated chunk content",
+		slog.WarnContext(ctx, "Semantic model returned empty summary; falling back to truncated chunk content",
 			"path", sourcePath,
 			"chunk_index", ch.Index,
 			"original_length", len(ch.Content))
 
 		fallback := ch.Content
 		if len(fallback) > maxEmbeddingInputLength {
-			fallback = fallback[:maxEmbeddingInputLength] + "..."
-			slog.Debug("Truncated fallback content to fit embedding model limits",
+			fallback = strings.ToValidUTF8(fallback[:maxEmbeddingInputLength], "") + "..."
+			slog.DebugContext(ctx, "Truncated fallback content to fit embedding model limits",
 				"original_length", len(ch.Content),
 				"truncated_length", len(fallback))
 		}
@@ -326,15 +327,15 @@ func (b *llmSemanticEmbeddingBuilder) BuildEmbeddingInput(ctx context.Context, s
 
 	// Truncate if embedding input is unexpectedly long
 	if len(embeddingInput) > maxEmbeddingInputLength {
-		slog.Warn("Semantic embedding input exceeds model limits; truncating",
+		slog.WarnContext(ctx, "Semantic embedding input exceeds model limits; truncating",
 			"path", sourcePath,
 			"chunk_index", ch.Index,
 			"original_length", len(embeddingInput),
 			"truncated_length", maxEmbeddingInputLength)
-		embeddingInput = embeddingInput[:maxEmbeddingInputLength] + "..."
+		embeddingInput = strings.ToValidUTF8(embeddingInput[:maxEmbeddingInputLength], "") + "..."
 	}
 
-	slog.Debug("Generated semantic embedding input for chunk",
+	slog.DebugContext(ctx, "Generated semantic embedding input for chunk",
 		"path", sourcePath,
 		"chunk_index", ch.Index,
 		"embedding_input", embeddingInput)
@@ -500,15 +501,15 @@ func humanizeMetadataKey(key string) string {
 }
 
 // calculateSemanticUsageCost calculates cost for semantic LLM usage.
-func calculateSemanticUsageCost(modelsStore modelStore, modelID string, usage *chat.Usage) float64 {
-	if usage == nil || modelsStore == nil || modelID == "" || strings.HasPrefix(modelID, "dmr/") {
+func calculateSemanticUsageCost(modelsStore modelStore, id modelsdev.ID, usage *chat.Usage) float64 {
+	if usage == nil || modelsStore == nil || !id.IsValid() || id.Provider == "dmr" {
 		return 0
 	}
 
-	model, err := modelsStore.GetModel(context.Background(), modelID)
+	model, err := modelsStore.GetModel(context.Background(), id)
 	if err != nil {
 		slog.Debug("Failed to get semantic model pricing from models.dev, cost will be 0",
-			"model_id", modelID,
+			"model_id", id.String(),
 			"error", err)
 		return 0
 	}

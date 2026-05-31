@@ -14,8 +14,10 @@ import (
 	"github.com/aymanbagabas/go-udiff"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/docker/docker-agent/pkg/concurrent"
+	"github.com/docker/docker-agent/pkg/lrucache"
 	"github.com/docker/docker-agent/pkg/tools"
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	"github.com/docker/docker-agent/pkg/tools/builtin/filesystem"
 	"github.com/docker/docker-agent/pkg/tui/styles"
 	"github.com/docker/docker-agent/pkg/tui/types"
 )
@@ -24,6 +26,12 @@ const (
 	tabWidth     = 4
 	lineNumWidth = 5
 	minWidth     = 80
+
+	// renderCacheSize bounds the number of cached edit_file renderings to
+	// avoid unbounded memory growth in long sessions where the agent makes
+	// many edits. Each entry holds a fully rendered diff string keyed by the
+	// tool call ID, which is unique per call.
+	renderCacheSize = 64
 )
 
 type toolRenderCache struct {
@@ -41,26 +49,32 @@ type toolRenderCache struct {
 }
 
 var (
-	cache   = make(map[string]*toolRenderCache) // keyed by toolCallID
-	cacheMu sync.RWMutex
+	// cacheMu guards both the LRU and the per-entry fields. A regular Mutex
+	// (not RWMutex) is used because LRU.Get mutates the recency list.
+	cache   = lrucache.New[string, *toolRenderCache](renderCacheSize)
+	cacheMu sync.Mutex
 
-	lexerCache   = make(map[string]chroma.Lexer)
-	lexerCacheMu sync.RWMutex
+	lexerCache concurrent.Map[string, chroma.Lexer]
 )
 
 // InvalidateCaches clears all render caches.
 // Call this when the theme changes to pick up new colors.
 func InvalidateCaches() {
 	cacheMu.Lock()
-	for _, c := range cache {
+	cache.Range(func(_ string, c *toolRenderCache) bool {
 		c.renderCached = false
-	}
+		return true
+	})
 	cacheMu.Unlock()
 }
 
 type chromaToken struct {
 	Text  string
 	Style lipgloss.Style
+	// Emphasized marks tokens whose underlying text was identified as part
+	// of a word-level diff. Renderers paint these with a stronger background
+	// so users can locate the precise edit within a long line.
+	Emphasized bool
 }
 
 type linePair struct {
@@ -71,37 +85,29 @@ type linePair struct {
 }
 
 func getOrCreateCache(toolCallID string) *toolRenderCache {
-	cacheMu.RLock()
-	if c, ok := cache[toolCallID]; ok {
-		cacheMu.RUnlock()
-		return c
-	}
-	cacheMu.RUnlock()
-
 	cacheMu.Lock()
 	defer cacheMu.Unlock()
-	// Double-check after acquiring write lock
-	if c, ok := cache[toolCallID]; ok {
+	if c, ok := cache.Get(toolCallID); ok {
 		return c
 	}
 	c := &toolRenderCache{}
-	cache[toolCallID] = c
+	cache.Put(toolCallID, c)
 	return c
 }
 
 func renderEditFile(toolCall tools.ToolCall, width int, splitView bool, toolStatus types.ToolStatus) string {
 	c := getOrCreateCache(toolCall.ID)
 
-	cacheMu.RLock()
+	cacheMu.Lock()
 	if c.renderCached &&
 		c.renderedWidth == width &&
 		c.renderedSplit == splitView &&
 		c.renderedStatus == toolStatus {
 		result := c.rendered
-		cacheMu.RUnlock()
+		cacheMu.Unlock()
 		return result
 	}
-	cacheMu.RUnlock()
+	cacheMu.Unlock()
 
 	result := renderEditFileUncached(toolCall, width, splitView, toolStatus)
 
@@ -117,7 +123,7 @@ func renderEditFile(toolCall tools.ToolCall, width int, splitView bool, toolStat
 }
 
 func renderEditFileUncached(toolCall tools.ToolCall, width int, splitView bool, toolStatus types.ToolStatus) string {
-	args, err := builtin.ParseEditFileArgs([]byte(toolCall.Function.Arguments))
+	args, err := filesystem.ParseEditFileArgs([]byte(toolCall.Function.Arguments))
 	if err != nil {
 		return ""
 	}
@@ -148,13 +154,13 @@ func renderEditFileUncached(toolCall tools.ToolCall, width int, splitView bool, 
 func countDiffLines(toolCall tools.ToolCall, _ types.ToolStatus) (added, removed int) {
 	c := getOrCreateCache(toolCall.ID)
 
-	cacheMu.RLock()
+	cacheMu.Lock()
 	if c.lineCounted {
 		added, removed = c.added, c.removed
-		cacheMu.RUnlock()
+		cacheMu.Unlock()
 		return added, removed
 	}
-	cacheMu.RUnlock()
+	cacheMu.Unlock()
 
 	added, removed = countDiffLinesUncached(toolCall)
 
@@ -168,7 +174,7 @@ func countDiffLines(toolCall tools.ToolCall, _ types.ToolStatus) (added, removed
 }
 
 func countDiffLinesUncached(toolCall tools.ToolCall) (added, removed int) {
-	args, err := builtin.ParseEditFileArgs([]byte(toolCall.Function.Arguments))
+	args, err := filesystem.ParseEditFileArgs([]byte(toolCall.Function.Arguments))
 	if err != nil {
 		return 0, 0
 	}
@@ -257,22 +263,14 @@ func normalizeDiff(diff []*udiff.Hunk) []*udiff.Hunk {
 func syntaxHighlight(code, filePath string) []chromaToken {
 	ext := filepath.Ext(filePath)
 
-	// Try to get lexer from cache
-	lexerCacheMu.RLock()
-	lexer, ok := lexerCache[ext]
-	lexerCacheMu.RUnlock()
-
+	lexer, ok := lexerCache.Load(ext)
 	if !ok {
-		// Cache miss - compute and store
 		lexer = lexers.Match(filePath)
 		if lexer == nil {
 			lexer = lexers.Fallback
 		}
 		lexer = chroma.Coalesce(lexer)
-
-		lexerCacheMu.Lock()
-		lexerCache[ext] = lexer
-		lexerCacheMu.Unlock()
+		lexerCache.Store(ext, lexer)
 	}
 
 	style := styles.ChromaStyle()
@@ -316,18 +314,111 @@ func chromaToLipgloss(tokenType chroma.TokenType, style *chroma.Style) lipgloss.
 	return lipStyle
 }
 
+// segRange records the byte extent of a single word-diff segment within the
+// full line, plus whether that extent represents a change.
+type segRange struct {
+	start, end int
+	changed    bool
+}
+
+// applyWordEmphasis re-tags chroma tokens so that any portion of the token
+// text that falls inside a "changed" word-diff segment is split off into its
+// own emphasized token. Token boundaries from chroma and from the word-diff
+// rarely line up, so each chroma token is sliced against the segment cursor
+// to produce correctly emphasized sub-tokens.
+func applyWordEmphasis(tokens []chromaToken, segs []wordSegment) []chromaToken {
+	if len(segs) == 0 {
+		return tokens
+	}
+
+	ranges := make([]segRange, 0, len(segs))
+	pos := 0
+	for _, s := range segs {
+		ranges = append(ranges, segRange{start: pos, end: pos + len(s.Text), changed: s.Changed})
+		pos += len(s.Text)
+	}
+
+	out := make([]chromaToken, 0, len(tokens))
+	bytePos := 0
+	for _, tok := range tokens {
+		text := tok.Text
+		tokStart := bytePos
+		tokEnd := bytePos + len(text)
+
+		cursor := tokStart
+		for cursor < tokEnd {
+			r := findSegRange(ranges, cursor)
+			if r == nil {
+				out = append(out, chromaToken{
+					Text:  text[cursor-tokStart:],
+					Style: tok.Style,
+				})
+				break
+			}
+			end := min(tokEnd, r.end)
+			sub := text[cursor-tokStart : end-tokStart]
+			if sub != "" {
+				out = append(out, chromaToken{
+					Text:       sub,
+					Style:      tok.Style,
+					Emphasized: r.changed,
+				})
+			}
+			cursor = end
+		}
+		bytePos = tokEnd
+	}
+
+	return out
+}
+
+func findSegRange(ranges []segRange, pos int) *segRange {
+	for i := range ranges {
+		if pos >= ranges[i].start && pos < ranges[i].end {
+			return &ranges[i]
+		}
+	}
+	return nil
+}
+
+// emphasisStyleFor returns the per-side emphasis style (with a stronger
+// background tint) for the row's diff kind. Returns the unchanged style for
+// kinds that should never carry word-level emphasis.
+func emphasisStyleFor(kind udiff.OpKind) lipgloss.Style {
+	switch kind {
+	case udiff.Delete:
+		return styles.DiffRemoveEmphStyle
+	case udiff.Insert:
+		return styles.DiffAddEmphStyle
+	default:
+		return styles.DiffUnchangedStyle
+	}
+}
+
 func renderDiffWithSyntaxHighlight(diff []*udiff.Hunk, filePath string, width int) string {
 	var output strings.Builder
 	contentWidth := width - lineNumWidth
 
 	for _, hunk := range diff {
+		// Build word-diff lookups for paired delete/insert lines so we can
+		// emphasize the precise tokens that changed.
+		wordDiffs := buildLineWordDiffs(hunk.Lines)
+
 		oldLineNum := hunk.FromLine
 		newLineNum := hunk.ToLine
 
-		for _, line := range hunk.Lines {
+		for li, line := range hunk.Lines {
 			lineNum := getDisplayLineNumber(&line, &oldLineNum, &newLineNum)
 			content := prepareContent(line.Content)
 			tokens := syntaxHighlight(content, filePath)
+			if wd, ok := wordDiffs[li]; ok {
+				switch line.Kind {
+				case udiff.Delete:
+					tokens = applyWordEmphasis(tokens, wd.old)
+				case udiff.Insert:
+					tokens = applyWordEmphasis(tokens, wd.new)
+				}
+			}
 			lineStyle := getLineStyle(line.Kind)
 			wrappedTokens := wrapTokens(tokens, contentWidth)
 
@@ -340,7 +431,7 @@ func renderDiffWithSyntaxHighlight(diff []*udiff.Hunk, filePath string, width in
 					// Use continuation indicator for wrapped lines
 					lineNumStr = styles.LineNumberStyle.Render("   → ")
 				}
-				rendered := renderTokensWithStyle(tokenLine, lineStyle)
+				rendered := renderTokensWithStyle(tokenLine, lineStyle, line.Kind)
 				padded := padToWidth(rendered, contentWidth, lineStyle)
 				output.WriteString(lineNumStr + padded + "\n")
 			}
@@ -364,8 +455,22 @@ func renderSplitDiffWithSyntaxHighlight(diff []*udiff.Hunk, filePath string, wid
 
 	for _, hunk := range diff {
 		for _, pair := range pairDiffLines(hunk.Lines, hunk.FromLine, hunk.ToLine) {
-			leftLines := renderSplitSide(pair.old, pair.oldLineNum, filePath, contentWidth)
-			rightLines := renderSplitSide(pair.new, pair.newLineNum, filePath, contentWidth)
+			// Word-diff is only meaningful when both halves are present
+			// and represent a delete/insert pair. Inputs go through
+			// prepareContent so the segment byte offsets line up with the
+			// chroma tokens produced for rendering (which also receive
+			// tab-expanded content).
+			var oldSegs, newSegs []wordSegment
+			if pair.old != nil && pair.new != nil &&
+				pair.old.Kind == udiff.Delete && pair.new.Kind == udiff.Insert {
+				oldSegs, newSegs = diffWords(
+					prepareContent(pair.old.Content),
+					prepareContent(pair.new.Content),
+				)
+			}
+
+			leftLines := renderSplitSide(pair.old, pair.oldLineNum, filePath, contentWidth, oldSegs)
+			rightLines := renderSplitSide(pair.new, pair.newLineNum, filePath, contentWidth, newSegs)
 
 			// Ensure both sides have the same number of lines for alignment
 			maxLines := max(len(rightLines), len(leftLines))
@@ -387,6 +492,32 @@ func renderSplitDiffWithSyntaxHighlight(diff []*udiff.Hunk, filePath string, wid
 	}
 
 	return strings.TrimSuffix(output.String(), "\n")
+}
+
+// lineWordDiff holds the per-side segment arrays computed for one
+// delete/insert pair. It is keyed by the *delete* line index — the matching
+// insert sits directly after it.
+type lineWordDiff struct {
+	old []wordSegment
+	new []wordSegment
+}
+
+func buildLineWordDiffs(lines []udiff.Line) map[int]lineWordDiff {
+	out := map[int]lineWordDiff{}
+	for i := range len(lines) - 1 {
+		if lines[i].Kind != udiff.Delete || lines[i+1].Kind != udiff.Insert {
+			continue
+		}
+		// Use prepareContent so segment offsets align with the chroma
+		// tokens (which are produced from the same tab-expanded text).
+		oldText := prepareContent(lines[i].Content)
+		newText := prepareContent(lines[i+1].Content)
+		oldSegs, newSegs := diffWords(oldText, newText)
+		wd := lineWordDiff{old: oldSegs, new: newSegs}
+		out[i] = wd
+		out[i+1] = wd
+	}
+	return out
 }
 
 func getDisplayLineNumber(line *udiff.Line, oldLineNum, newLineNum *int) int {
@@ -462,7 +593,11 @@ func wrapTokens(tokens []chromaToken, maxWidth int) [][]chromaToken {
 				fitWidth = runewidth.RuneWidth(r)
 			}
 
-			currentLine = append(currentLine, chromaToken{Text: text[:fitLen], Style: token.Style})
+			currentLine = append(currentLine, chromaToken{
+				Text:       text[:fitLen],
+				Style:      token.Style,
+				Emphasized: token.Emphasized,
+			})
 			currentWidth += fitWidth
 			text = text[fitLen:]
 		}
@@ -479,14 +614,20 @@ func wrapTokens(tokens []chromaToken, maxWidth int) [][]chromaToken {
 	return lines
 }
 
-// renderSplitSide renders a split side with text wrapping support
-func renderSplitSide(line *udiff.Line, lineNum int, filePath string, width int) []string {
+// renderSplitSide renders a split side with text wrapping support.
+// When wordSegs is non-nil and the line is part of a delete/insert pair, the
+// chroma tokens are re-tagged so the changed substrings render with a
+// stronger background tint.
+func renderSplitSide(line *udiff.Line, lineNum int, filePath string, width int, wordSegs []wordSegment) []string {
 	if line == nil {
 		return []string{renderEmptySplitSide(width)}
 	}
 
 	content := prepareContent(line.Content)
 	tokens := syntaxHighlight(content, filePath)
+	if len(wordSegs) > 0 {
+		tokens = applyWordEmphasis(tokens, wordSegs)
+	}
 	lineStyle := getLineStyle(line.Kind)
 	wrappedTokens := wrapTokens(tokens, width)
 
@@ -500,7 +641,7 @@ func renderSplitSide(line *udiff.Line, lineNum int, filePath string, width int) 
 			// Use continuation indicator for wrapped lines
 			lineNumStr = "   → "
 		}
-		rendered := renderTokensWithStyle(tokenLine, lineStyle)
+		rendered := renderTokensWithStyle(tokenLine, lineStyle, line.Kind)
 		padded := padToWidth(rendered, width, lineStyle)
 		result = append(result, styles.LineNumberStyle.Render(lineNumStr)+padded)
 	}
@@ -515,12 +656,21 @@ func renderEmptySplitSide(width int) string {
 	return styles.LineNumberStyle.Render(lineNumStr) + emptySpace
 }
 
-func renderTokensWithStyle(tokens []chromaToken, lineStyle lipgloss.Style) string {
+func renderTokensWithStyle(tokens []chromaToken, lineStyle lipgloss.Style, kind udiff.OpKind) string {
 	var output strings.Builder
 
+	emph := emphasisStyleFor(kind)
 	for _, token := range tokens {
-		styledToken := token.Style.Background(lineStyle.GetBackground())
-		output.WriteString(styledToken.Render(token.Text))
+		if token.Emphasized && (kind == udiff.Delete || kind == udiff.Insert) {
+			// Keep the chroma foreground so syntax colors carry through into
+			// the emphasized block, but override the background with the
+			// stronger emphasis tint and add bold for extra weight.
+			style := token.Style.Background(emph.GetBackground()).Bold(true)
+			output.WriteString(style.Render(token.Text))
+			continue
+		}
+		style := token.Style.Background(lineStyle.GetBackground())
+		output.WriteString(style.Render(token.Text))
 	}
 
 	return output.String()

@@ -3,16 +3,18 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"sync"
 	"testing"
 
 	"gotest.tools/v3/assert"
 
+	"github.com/docker/docker-agent/pkg/config/types"
 	"github.com/docker/docker-agent/pkg/runtime"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/sessiontitle"
 	"github.com/docker/docker-agent/pkg/tools"
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	skillstool "github.com/docker/docker-agent/pkg/tools/builtin/skills"
 	mcptools "github.com/docker/docker-agent/pkg/tools/mcp"
 )
 
@@ -27,14 +29,38 @@ type mockRuntime struct {
 	elicitationLastAction tools.ElicitationAction
 }
 
+// mockRuntimeWithOverrides extends mockRuntime to allow method overriding for testing
+type mockRuntimeWithOverrides struct {
+	*mockRuntime
+
+	setCurrentAgentFn  func(string) error
+	currentAgentInfoFn func(context.Context) runtime.CurrentAgentInfo
+}
+
+func (m *mockRuntimeWithOverrides) SetCurrentAgent(name string) error {
+	if m.setCurrentAgentFn != nil {
+		return m.setCurrentAgentFn(name)
+	}
+	return m.mockRuntime.SetCurrentAgent(name)
+}
+
+func (m *mockRuntimeWithOverrides) CurrentAgentInfo(ctx context.Context) runtime.CurrentAgentInfo {
+	if m.currentAgentInfoFn != nil {
+		return m.currentAgentInfoFn(ctx)
+	}
+	return m.mockRuntime.CurrentAgentInfo(ctx)
+}
+
 func (m *mockRuntime) CurrentAgentName() string { return "test" }
 func (m *mockRuntime) CurrentAgentInfo(context.Context) runtime.CurrentAgentInfo {
 	return runtime.CurrentAgentInfo{Name: "test"}
 }
-func (m *mockRuntime) SetCurrentAgent(string) error                                          { return nil }
-func (m *mockRuntime) CurrentAgentTools(context.Context) ([]tools.Tool, error)               { return nil, nil }
-func (m *mockRuntime) EmitStartupInfo(context.Context, *session.Session, chan runtime.Event) {}
-func (m *mockRuntime) ResetStartupInfo()                                                     {}
+func (m *mockRuntime) SetCurrentAgent(string) error                                         { return nil }
+func (m *mockRuntime) CurrentAgentTools(context.Context) ([]tools.Tool, error)              { return nil, nil }
+func (m *mockRuntime) CurrentAgentToolsetStatuses() []tools.ToolsetStatus                   { return nil }
+func (m *mockRuntime) RestartToolset(context.Context, string) error                         { return nil }
+func (m *mockRuntime) EmitStartupInfo(context.Context, *session.Session, runtime.EventSink) {}
+func (m *mockRuntime) ResetStartupInfo()                                                    {}
 func (m *mockRuntime) Run(context.Context, *session.Session) ([]session.Message, error) {
 	return nil, nil
 }
@@ -46,10 +72,14 @@ func (m *mockRuntime) ResumeElicitation(_ context.Context, action tools.Elicitat
 	m.elicitationLastAction = action
 	return nil
 }
-func (m *mockRuntime) SessionStore() session.Store                                             { return nil }
-func (m *mockRuntime) Summarize(context.Context, *session.Session, string, chan runtime.Event) {}
-func (m *mockRuntime) PermissionsInfo() *runtime.PermissionsInfo                               { return nil }
-func (m *mockRuntime) CurrentAgentSkillsToolset() *builtin.SkillsToolset                       { return nil }
+func (m *mockRuntime) SessionStore() session.Store                                            { return nil }
+func (m *mockRuntime) Summarize(context.Context, *session.Session, string, runtime.EventSink) {}
+func (m *mockRuntime) PermissionsInfo() *runtime.PermissionsInfo                              { return nil }
+func (m *mockRuntime) CurrentAgentSkillsToolset() *skillstool.ToolSet                         { return nil }
+func (m *mockRuntime) RunSkillFork(context.Context, *session.Session, skillstool.RunSkillArgs, runtime.EventSink) (*tools.ToolCallResult, error) {
+	return nil, nil
+}
+
 func (m *mockRuntime) CurrentMCPPrompts(context.Context) map[string]mcptools.PromptInfo {
 	return nil
 }
@@ -62,6 +92,12 @@ func (m *mockRuntime) TitleGenerator() *sessiontitle.Generator                  
 func (m *mockRuntime) Close() error                                                          { return nil }
 func (m *mockRuntime) Steer(runtime.QueuedMessage) error                                     { return nil }
 func (m *mockRuntime) FollowUp(runtime.QueuedMessage) error                                  { return nil }
+func (m *mockRuntime) QueueStatus() runtime.QueueStatus                                      { return runtime.QueueStatus{} }
+func (m *mockRuntime) TogglePause(context.Context) (bool, error)                             { return false, nil }
+func (m *mockRuntime) SetAgentModel(context.Context, string, string) error                   { return nil }
+func (m *mockRuntime) AvailableModels(context.Context) []runtime.ModelChoice                 { return nil }
+func (m *mockRuntime) SupportsModelSwitching() bool                                          { return false }
+func (m *mockRuntime) OnToolsChanged(func(runtime.Event))                                    {}
 func (m *mockRuntime) RegenerateTitle(context.Context, *session.Session, chan runtime.Event) {}
 
 func (m *mockRuntime) Resume(_ context.Context, req runtime.ResumeRequest) {
@@ -194,7 +230,7 @@ func TestElicitationAutoDeclineInJSONMode(t *testing.T) {
 			&runtime.ElicitationRequestEvent{
 				Type:    "elicitation_request",
 				Message: "Please authorize",
-				Meta:    map[string]any{"cagent/server_url": "https://example.com"},
+				Meta:    map[string]any{"docker-agent/server_url": "https://example.com"},
 			},
 		},
 	}
@@ -238,4 +274,169 @@ func TestMaxIterationsSafetyCapJSONMode(t *testing.T) {
 		assert.Equal(t, resumes[i].Type, runtime.ResumeTypeApprove)
 	}
 	assert.Equal(t, resumes[maxAutoExtensions].Type, runtime.ResumeTypeReject)
+}
+
+// TestPrepareUserMessage_AgentSwitching tests that PrepareUserMessage correctly
+// handles agent-switching commands and returns empty messages on switch failures.
+func TestPrepareUserMessage_AgentSwitching(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		userInput         string
+		commandAgent      string
+		setAgentErr       error
+		expectedContent   string
+		expectedAttach    string
+		expectAgentSwitch bool
+		expectNilMessage  bool
+		expectError       bool
+	}{
+		{
+			name:              "agent switch succeeds with trailing args",
+			userInput:         "/plan design a login flow",
+			commandAgent:      "planner",
+			setAgentErr:       nil,
+			expectedContent:   "design a login flow",
+			expectedAttach:    "",
+			expectAgentSwitch: true,
+		},
+		{
+			name:              "agent switch succeeds without trailing args",
+			userInput:         "/plan",
+			commandAgent:      "planner",
+			setAgentErr:       nil,
+			expectedContent:   "",
+			expectedAttach:    "",
+			expectAgentSwitch: true,
+			expectNilMessage:  true,
+		},
+		{
+			name:              "agent switch fails - returns error",
+			userInput:         "/plan design a login flow",
+			commandAgent:      "planner",
+			setAgentErr:       errors.New("agent not found"),
+			expectedContent:   "",
+			expectedAttach:    "",
+			expectAgentSwitch: true,
+			expectError:       true,
+		},
+		{
+			name:              "non-agent command - no switch",
+			userInput:         "/test regular command",
+			commandAgent:      "",
+			setAgentErr:       nil,
+			expectedContent:   "This is the test instruction regular command",
+			expectedAttach:    "",
+			expectAgentSwitch: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Create a mock runtime that tracks SetCurrentAgent calls
+			var setAgentCalled bool
+			var setAgentName string
+			rt := &mockRuntimeWithOverrides{
+				mockRuntime: &mockRuntime{events: []runtime.Event{}},
+			}
+
+			// Override SetCurrentAgent to track calls and return the test error
+			rt.setCurrentAgentFn = func(name string) error {
+				setAgentCalled = true
+				setAgentName = name
+				return tt.setAgentErr
+			}
+
+			// Override CurrentAgentInfo to return test commands
+			rt.currentAgentInfoFn = func(context.Context) runtime.CurrentAgentInfo {
+				commands := make(map[string]types.Command)
+				if tt.commandAgent != "" {
+					commands["plan"] = types.Command{
+						Description: "Hand off to the planner",
+						Agent:       tt.commandAgent,
+					}
+				} else {
+					commands["test"] = types.Command{
+						Instruction: "This is the test instruction",
+					}
+				}
+				return runtime.CurrentAgentInfo{
+					Name:     "test",
+					Commands: commands,
+				}
+			}
+
+			msg, attachPath, err := PrepareUserMessage(t.Context(), rt, tt.userInput, "")
+			if tt.expectError {
+				assert.Assert(t, err != nil, "Expected error but got nil")
+				return
+			}
+			assert.NilError(t, err)
+
+			// Verify agent switch was called (or not)
+			assert.Equal(t, tt.expectAgentSwitch, setAgentCalled, "SetCurrentAgent call mismatch")
+			if tt.expectAgentSwitch && setAgentCalled {
+				assert.Equal(t, tt.commandAgent, setAgentName, "Wrong agent name passed to SetCurrentAgent")
+			}
+
+			// Verify message content
+			if tt.expectNilMessage {
+				assert.Assert(t, msg == nil, "Expected nil message")
+			} else {
+				assert.Equal(t, tt.expectedContent, msg.Message.Content, "Message content mismatch")
+			}
+			assert.Equal(t, tt.expectedAttach, attachPath, "Attachment path mismatch")
+		})
+	}
+}
+
+func TestPrepareUserMessage_EmptyMessageForAgentOnlyCommand(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntimeWithOverrides{
+		mockRuntime: &mockRuntime{},
+	}
+	rt.currentAgentInfoFn = func(context.Context) runtime.CurrentAgentInfo {
+		return runtime.CurrentAgentInfo{
+			Name: "test",
+			Commands: map[string]types.Command{
+				"plan": {Agent: "planner"}, // agent-only, no instruction
+			},
+		}
+	}
+
+	msg, attachPath, err := PrepareUserMessage(t.Context(), rt, "/plan", "")
+	assert.NilError(t, err)
+
+	// Agent-only command with no args should produce nil message
+	assert.Assert(t, msg == nil, "Expected nil message for agent-only command with no args")
+	assert.Equal(t, "", attachPath, "Expected no attachment")
+}
+
+// TestPrepareUserMessage_CommandResolution tests that commands are resolved
+// correctly before agent switching.
+func TestPrepareUserMessage_CommandResolution(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntimeWithOverrides{
+		mockRuntime: &mockRuntime{},
+	}
+	rt.currentAgentInfoFn = func(context.Context) runtime.CurrentAgentInfo {
+		return runtime.CurrentAgentInfo{
+			Name: "test",
+			Commands: map[string]types.Command{
+				"fix": {
+					Instruction: "Fix the file ${args[0]}",
+				},
+			},
+		}
+	}
+
+	msg, _, err := PrepareUserMessage(t.Context(), rt, "/fix main.go", "")
+	assert.NilError(t, err)
+
+	assert.Equal(t, "Fix the file main.go", msg.Message.Content, "Command should be resolved with args")
 }

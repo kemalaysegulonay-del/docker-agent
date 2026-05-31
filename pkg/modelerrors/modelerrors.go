@@ -6,8 +6,10 @@ package modelerrors
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -30,7 +32,14 @@ type StatusError struct {
 }
 
 func (e *StatusError) Error() string {
-	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, e.Err.Error())
+	underlying := e.Err.Error()
+	// Lift structured details out of the SDK error envelope (URL + status +
+	// JSON body) when possible, so the user sees what the provider actually
+	// said instead of a generic "400 Bad Request".
+	if details := parseProviderError(underlying); details != "" {
+		return fmt.Sprintf("HTTP %d: %s", e.StatusCode, details)
+	}
+	return fmt.Sprintf("HTTP %d: %s", e.StatusCode, underlying)
 }
 
 func (e *StatusError) Unwrap() error {
@@ -67,19 +76,51 @@ const (
 	DefaultCooldown = 1 * time.Minute
 )
 
+// OverflowKind classifies the cause of a context overflow, so the runtime
+// and UI can react differently to each shape.
+//
+//   - [OverflowKindTokens]: the accumulated conversation exceeds the model's
+//     context window. Token-count rejection. Compaction can usually help.
+//   - [OverflowKindWire]: the request body exceeds the provider's wire-level
+//     limit (e.g. Anthropic's 32 MB cap, gateway 413s). Compaction usually
+//     CANNOT help because the offending single turn still has to be sent.
+//   - [OverflowKindMedia]: an image, PDF, or similar attachment in the
+//     conversation exceeds the provider's media constraints (size, page
+//     count, dimensions).
+type OverflowKind string
+
+const (
+	OverflowKindTokens OverflowKind = "tokens"
+	OverflowKindWire   OverflowKind = "wire"
+	OverflowKindMedia  OverflowKind = "media"
+)
+
 // ContextOverflowError wraps an underlying error to indicate that the failure
-// was caused by the conversation context exceeding the model's context window.
+// was caused by the conversation context exceeding some provider-side limit.
 // This is used to trigger auto-compaction in the runtime loop instead of
 // surfacing raw HTTP errors to the user.
+//
+// Kind classifies the specific shape of the overflow ([OverflowKindTokens] by
+// default for backwards compatibility). Use [NewContextOverflowError] to have
+// it set automatically by classification, or build the struct directly to
+// force a Kind.
 type ContextOverflowError struct {
 	Underlying error
+	Kind       OverflowKind
 }
 
 // NewContextOverflowError creates a ContextOverflowError wrapping the given
-// underlying error. Use this constructor rather than building the struct
-// directly so that future field additions don't break callers.
+// underlying error. The Kind is inferred from the underlying error via
+// [classifyOverflow]; if classification yields no result, Kind defaults to
+// [OverflowKindTokens] (the historical behaviour). Use this constructor
+// rather than building the struct directly so future field additions don't
+// break callers.
 func NewContextOverflowError(underlying error) *ContextOverflowError {
-	return &ContextOverflowError{Underlying: underlying}
+	kind := classifyOverflow(underlying)
+	if kind == "" {
+		kind = OverflowKindTokens
+	}
+	return &ContextOverflowError{Underlying: underlying, Kind: kind}
 }
 
 func (e *ContextOverflowError) Error() string {
@@ -93,60 +134,155 @@ func (e *ContextOverflowError) Unwrap() error {
 	return e.Underlying
 }
 
-// contextOverflowPatterns contains error message substrings that indicate the
-// prompt/context exceeds the model's context window. These patterns are checked
-// case-insensitively against error messages from various providers.
-var contextOverflowPatterns = []string{
-	"prompt is too long",
-	"maximum context length",
-	"context length exceeded",
-	"context_length_exceeded",
-	"max_tokens must be greater than",
+// tokenOverflowPatterns matches token-count rejections from various providers.
+// Best-effort substring match (case-insensitive) against the error message.
+// Provider error wording is not contractual and drifts over time; this list
+// is heuristics derived from observed errors. Adding a provider only requires
+// appending a phrase.
+var tokenOverflowPatterns = []string{
+	"prompt is too long",                // Anthropic, Vertex (with Anthropic body)
+	"prompt too long",                   // Ollama ("prompt too long; exceeded ...")
+	"maximum context length",            // OpenAI, OpenRouter, DeepSeek, vLLM
+	"context length exceeded",           // OpenAI legacy
+	"context_length_exceeded",           // OpenAI structured code
+	"input is too long",                 // Bedrock
+	"input token count",                 // Gemini ("...exceeds the maximum")
+	"exceeds the context window",        // OpenAI Responses API
+	"reduce the length of the messages", // Groq
+	"exceeded model token limit",        // Kimi, Moonshot
+	"context window exceeds limit",      // MiniMax
+	"model_context_window_exceeded",     // z.ai
+	"max_tokens must be greater than",   // Anthropic edge case: thinking-budget cascade
 	"maximum number of tokens",
 	"content length exceeds",
-	"request too large",
-	"payload too large",
-	"input is too long",
 	"exceeds the model's max token",
 	"token limit",
 	"reduce your prompt",
-	"reduce the length",
 }
 
-// IsContextOverflowError checks whether the error indicates the conversation
-// context has exceeded the model's context window. It inspects both structured
-// SDK error types and raw error message patterns.
-//
-// Recognised patterns include:
-//   - Anthropic 400 "prompt is too long: N tokens > M maximum"
-//   - Anthropic 400 "max_tokens must be greater than thinking.budget_tokens"
-//     (emitted when the prompt is so large that max_tokens can't accommodate
-//     the thinking budget — a proxy for context overflow)
-//   - OpenAI 400 "maximum context length" / "context_length_exceeded"
-//   - Anthropic 500 that is actually a context overflow (heuristic: the error
-//     message is opaque but the conversation was already near the limit)
-//
-// This function intentionally does NOT match generic 500 errors; callers
-// that want to treat an opaque 500 as overflow must check separately with
-// additional context (e.g., session token counts).
+// wireOverflowPatterns matches wire-level rejections — the whole request body
+// is too big to send regardless of context window. These trigger different
+// recovery than token overflows (compaction-as-retry won't help when the
+// latest turn alone is over the wire cap).
+var wireOverflowPatterns = []string{
+	"request_too_large",        // Anthropic structured error.type
+	"request too large",        // Anthropic prose
+	"payload too large",        // HTTP 413 status text
+	"request entity too large", // RFC 7231 status text
+}
+
+// mediaOverflowPatterns matches media-specific rejections (image too big, PDF
+// too many pages, etc.). Distinguished from token/wire because recovery
+// strategies differ — stripping media from history can help here.
+var mediaOverflowPatterns = []string{
+	"image exceeds",           // Anthropic
+	"image dimensions exceed", // Anthropic many-image
+	"pdf pages",               // "maximum of N PDF pages" — Anthropic
+}
+
+// IsContextOverflowError reports whether err indicates the conversation
+// exceeded a provider-side limit (token window, wire size, or media size).
+// Use [OverflowKindOf] to distinguish the three shapes.
 func IsContextOverflowError(err error) bool {
 	if err == nil {
 		return false
 	}
-
-	// Already wrapped
 	if _, ok := errors.AsType[*ContextOverflowError](err); ok {
 		return true
 	}
+	return classifyOverflow(err) != ""
+}
 
-	errMsg := strings.ToLower(err.Error())
-	for _, pattern := range contextOverflowPatterns {
-		if strings.Contains(errMsg, pattern) {
-			return true
+// OverflowKindOf returns the [OverflowKind] of err, or "" if it isn't an
+// overflow error. If err is already wrapped in a [*ContextOverflowError]
+// with a non-empty Kind, that Kind is returned; otherwise classification
+// runs on the unwrapped error.
+func OverflowKindOf(err error) OverflowKind {
+	if err == nil {
+		return ""
+	}
+	if coe, ok := errors.AsType[*ContextOverflowError](err); ok {
+		if coe.Kind != "" {
+			return coe.Kind
+		}
+		// Legacy wrap with no Kind — try classifying the underlying.
+		if coe.Underlying != nil {
+			if k := classifyOverflow(coe.Underlying); k != "" {
+				return k
+			}
+		}
+		return OverflowKindTokens
+	}
+	return classifyOverflow(err)
+}
+
+// classifyOverflow inspects err for overflow signals and returns the matching
+// [OverflowKind], or "" if err is not an overflow error.
+//
+// The classifier runs two tiers, in order:
+//
+//	Tier 1 — structured signals (high confidence):
+//	  * body.error.type == "request_too_large"     → OverflowKindWire
+//	  * body.error.code == "context_length_exceeded" → OverflowKindTokens
+//	  * HTTP status 413                            → OverflowKindWire
+//
+//	Tier 2 — substring patterns (best-effort fallback):
+//	  * mediaOverflowPatterns → OverflowKindMedia
+//	  * wireOverflowPatterns  → OverflowKindWire
+//	  * tokenOverflowPatterns → OverflowKindTokens
+//
+// Tier 1 wins when both fire. Within Tier 2, media is checked first because
+// it is the most specific; wire before tokens because some wire signals
+// ("request too large") textually overlap with token-overflow phrasing in a
+// way that benefits from the wire match coming first.
+func classifyOverflow(err error) OverflowKind {
+	if err == nil {
+		return ""
+	}
+	// Already-wrapped errors carry their Kind; respect it.
+	if coe, ok := errors.AsType[*ContextOverflowError](err); ok && coe.Kind != "" {
+		return coe.Kind
+	}
+
+	raw := err.Error()
+
+	// Tier 1: structured body fields.
+	if body := firstJSONObject(raw); body != nil {
+		var parsed providerErrorBody
+		if json.Unmarshal(body, &parsed) == nil && parsed.Error != nil {
+			if parsed.Error.Type == "request_too_large" {
+				return OverflowKindWire
+			}
+			if code := scalarString(parsed.Error.Code); code == "context_length_exceeded" {
+				return OverflowKindTokens
+			}
 		}
 	}
 
-	return false
+	// Tier 1: HTTP status code (413 → wire).
+	if se, ok := errors.AsType[*StatusError](err); ok && se.StatusCode == http.StatusRequestEntityTooLarge {
+		return OverflowKindWire
+	}
+
+	// Tier 2: substring fallback. Media first (most specific), then wire,
+	// then tokens.
+	msg := strings.ToLower(raw)
+	for _, p := range mediaOverflowPatterns {
+		if strings.Contains(msg, p) {
+			return OverflowKindMedia
+		}
+	}
+	for _, p := range wireOverflowPatterns {
+		if strings.Contains(msg, p) {
+			return OverflowKindWire
+		}
+	}
+	for _, p := range tokenOverflowPatterns {
+		if strings.Contains(msg, p) {
+			return OverflowKindTokens
+		}
+	}
+	return ""
 }
 
 // statusCodeRegex matches HTTP status codes in error messages (e.g., "429", "500", ": 429 ")
@@ -206,6 +342,40 @@ func isRetryableStatusCode(statusCode int) bool {
 	default:
 		return false
 	}
+}
+
+// transientStatusCodePatterns contains error message substrings that indicate
+// a transient failure even when the HTTP status code would otherwise classify
+// the error as non-retryable (e.g. 4xx). Patterns MUST be lowercase: they are
+// compared against a lowercased error message (see [matchesTransientPattern]).
+//
+// Currently:
+//   - Vertex AI / Gemini intermittently returns 400 INVALID_ARGUMENT with the
+//     message "Please ensure that the number of function response parts is
+//     equal to the number of function call parts of the function call turn."
+//     even for well-formed requests; the same payload succeeds on retry.
+//     Without this override the run would surface a fatal error to the user
+//     and exit non-zero, see https://github.com/docker/docker-agent/issues/2683.
+var transientStatusCodePatterns = []string{
+	"number of function response parts",
+}
+
+// matchesTransientPattern reports whether the error's message matches one of
+// [transientStatusCodePatterns]. Used to override an otherwise non-retryable
+// HTTP status classification. Patterns are pre-lowercased (enforced by
+// declaration convention) and additionally lowercased here for defence in
+// depth, so a mixed-case pattern slipping into the list will still match.
+func matchesTransientPattern(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	for _, p := range transientStatusCodePatterns {
+		if strings.Contains(msg, strings.ToLower(p)) {
+			return true
+		}
+	}
+	return false
 }
 
 // retryablePatterns contains error message substrings that indicate a
@@ -284,7 +454,7 @@ func isRetryableModelError(err error) bool {
 
 	// First, try to extract HTTP status code from known SDK error types
 	if statusCode := extractHTTPStatusCode(err); statusCode != 0 {
-		retryable := isRetryableStatusCode(statusCode)
+		retryable := isRetryableStatusCode(statusCode) || matchesTransientPattern(err)
 		slog.Debug("Classified error by status code",
 			"status_code", statusCode,
 			"retryable", retryable)
@@ -378,7 +548,7 @@ func ClassifyModelError(err error) (retryable, rateLimited bool, retryAfter time
 		if statusErr.StatusCode == http.StatusTooManyRequests {
 			return false, true, statusErr.RetryAfter
 		}
-		return isRetryableStatusCode(statusErr.StatusCode), false, 0
+		return isRetryableStatusCode(statusErr.StatusCode) || matchesTransientPattern(err), false, 0
 	}
 
 	// Fallback: providers that don't yet wrap (e.g. Bedrock), or non-provider
@@ -388,24 +558,161 @@ func ClassifyModelError(err error) (retryable, rateLimited bool, retryAfter time
 		return false, true, 0 // No Retry-After without StatusError
 	}
 	if statusCode != 0 {
-		return isRetryableStatusCode(statusCode), false, 0
+		return isRetryableStatusCode(statusCode) || matchesTransientPattern(err), false, 0
 	}
 	return isRetryableModelError(err), false, 0
 }
 
 // FormatError returns a user-friendly error message for model errors.
-// Context overflow gets a dedicated actionable message; all other errors
-// pass through their original message.
+// Overflow errors get a kind-specific actionable message; other errors fall
+// through to err.Error(). For HTTP errors that text comes from *StatusError,
+// which itself extracts structured provider details (see parseProviderError).
+//
+// The messages are provider-agnostic by design: docker-agent supports many
+// LLM providers and the cap that triggered the rejection is a deployment
+// detail of the provider, not something the user can act on by name.
 func FormatError(err error) string {
 	if err == nil {
 		return ""
 	}
 
-	// Context overflow gets a dedicated, actionable message.
-	if _, ok := errors.AsType[*ContextOverflowError](err); ok {
+	switch OverflowKindOf(err) {
+	case OverflowKindWire:
+		return "Your message is too large for the AI provider. " +
+			"Try a smaller paste, attach the file separately, or split the content."
+	case OverflowKindMedia:
+		return "An image or file in this conversation is too large for the AI provider. " +
+			"Try a smaller file or remove it from context."
+	case OverflowKindTokens:
 		return "The conversation has exceeded the model's context window and automatic compaction is not enabled. " +
 			"Try running /compact to reduce the conversation size, or start a new session."
 	}
 
 	return err.Error()
+}
+
+// requestIDRegex matches the `(Request-ID: <id>)` segment that anthropic-sdk-go
+// and openai-go append between the status text and the response body.
+var requestIDRegex = regexp.MustCompile(`\(Request-ID:\s*([^)\s]+)\)`)
+
+// providerErrorBody is the union of JSON shapes returned by major LLM
+// providers in non-2xx response bodies:
+//
+//	Anthropic   {"type":"error","error":{"type":"...","message":"..."}}
+//	OpenAI      {"error":{"message":"...","type":"...","code":"...","param":"..."}}
+//	Gemini      {"error":{"code":N,"message":"...","status":"..."}}
+//	Proxies     {"message":"Bad Request"}
+type providerErrorBody struct {
+	Error *struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Code    any    `json:"code"`  // string (OpenAI) or number (Gemini)
+		Param   any    `json:"param"` // string or null
+		Status  string `json:"status"`
+	} `json:"error"`
+	Message string `json:"message"`
+}
+
+// parseProviderError returns a focused details line lifted from an SDK error
+// message of the form
+//
+//	<METHOD> "<URL>": <code> <statusText>[ (Request-ID: <id>)] <jsonBody>
+//
+// Returns "" when no JSON body is present or it has no recognised fields.
+func parseProviderError(s string) string {
+	body := firstJSONObject(s)
+	if body == nil {
+		return ""
+	}
+	var parsed providerErrorBody
+	if json.Unmarshal(body, &parsed) != nil {
+		return ""
+	}
+	details := formatProviderError(&parsed)
+	if details == "" {
+		return ""
+	}
+	if m := requestIDRegex.FindStringSubmatch(s); len(m) >= 2 {
+		details += " (Request-ID: " + m[1] + ")"
+	}
+	return details
+}
+
+// formatProviderError renders a parsed body as
+//
+//	<error.type>: <error.message> (code=..., param=..., status=...)
+//
+// Falls back to the top-level `message` field for minimal/proxy bodies.
+// Returns "" when the body has nothing useful.
+func formatProviderError(p *providerErrorBody) string {
+	if p.Error == nil || p.Error.Message == "" {
+		return p.Message
+	}
+	msg := p.Error.Message
+	if p.Error.Type != "" {
+		msg = p.Error.Type + ": " + msg
+	}
+
+	var meta []string
+	if code := scalarString(p.Error.Code); code != "" {
+		meta = append(meta, "code="+code)
+	}
+	if param := scalarString(p.Error.Param); param != "" {
+		meta = append(meta, "param="+param)
+	}
+	if p.Error.Status != "" && !strings.EqualFold(p.Error.Status, p.Error.Type) {
+		meta = append(meta, "status="+p.Error.Status)
+	}
+	if len(meta) > 0 {
+		msg += " (" + strings.Join(meta, ", ") + ")"
+	}
+	return msg
+}
+
+// firstJSONObject returns the first complete JSON object found in s, or nil.
+// encoding/json handles escaped quotes and braces inside string values.
+// Limits parsing to 1MB to prevent memory exhaustion from malicious or
+// accidentally huge error responses.
+//
+// To handle '{' characters in URLs or status text (e.g., "param={value}"),
+// we try parsing from each '{' position until we find valid JSON.
+func firstJSONObject(s string) []byte {
+	const maxJSONSize = 1 << 20 // 1MB
+
+	pos := 0
+	for {
+		idx := strings.IndexByte(s[pos:], '{')
+		if idx < 0 {
+			return nil
+		}
+		start := pos + idx
+
+		reader := io.LimitReader(strings.NewReader(s[start:]), maxJSONSize)
+		var raw json.RawMessage
+		if err := json.NewDecoder(reader).Decode(&raw); err == nil {
+			// Successfully decoded JSON
+			return raw
+		}
+		// Try next '{' position
+		pos = start + 1
+	}
+}
+
+// scalarString renders a JSON scalar as text. JSON numbers decode to float64;
+// whole numbers are rendered without a trailing ".0" so a code of 400 prints
+// as "400". Returns "" for nil and empty strings.
+func scalarString(v any) string {
+	switch x := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return x
+	case float64:
+		if x == float64(int64(x)) {
+			return strconv.FormatInt(int64(x), 10)
+		}
+		return strconv.FormatFloat(x, 'g', -1, 64)
+	default:
+		return fmt.Sprint(v)
+	}
 }

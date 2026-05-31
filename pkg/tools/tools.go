@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 
+	"github.com/docker/aijson"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -12,8 +14,14 @@ type ToolSet interface {
 	Tools(ctx context.Context) ([]Tool, error)
 }
 
-// NewHandler creates a type-safe tool handler from a function that accepts typed parameters.
-// It handles JSON unmarshaling of the tool call arguments into the specified type T.
+// NewHandler creates a type-safe tool handler from a function that accepts
+// typed parameters. It unmarshals the tool-call arguments via
+// [aijson.Unmarshal], which runs strict [encoding/json.Unmarshal] first and
+// only falls back to a narrow set of shape repairs (stringified array,
+// bare scalar where an array is expected, single-object placeholder, null
+// for primitive) when the strict parse fails. Repaired calls emit a
+// tool_input_repaired log entry so per-(model, tool) repair rates can be
+// tracked.
 func NewHandler[T any](fn func(context.Context, T) (*ToolCallResult, error)) ToolHandler {
 	return func(ctx context.Context, toolCall ToolCall) (*ToolCallResult, error) {
 		var params T
@@ -21,7 +29,14 @@ func NewHandler[T any](fn func(context.Context, T) (*ToolCallResult, error)) Too
 		if args == "" {
 			args = "{}"
 		}
-		if err := json.Unmarshal([]byte(args), &params); err != nil {
+
+		err := aijson.Unmarshal([]byte(args), &params, aijson.OnRepair(func(kinds []aijson.Kind) {
+			slog.InfoContext(ctx, "tool_input_repaired",
+				"tool", toolCall.Function.Name,
+				"repairs", kinds,
+			)
+		}))
+		if err != nil {
 			return nil, err
 		}
 		return fn(ctx, params)
@@ -68,6 +83,16 @@ type ToolCallResult struct {
 	// tool whose definition includes an OutputSchema. When non-nil it is the
 	// JSON-decoded structured result from the server.
 	StructuredContent any `json:"structuredContent,omitempty"`
+}
+
+func (r *ToolCallResult) WithoutPayload() *ToolCallResult {
+	if r == nil {
+		return nil
+	}
+	return &ToolCallResult{
+		IsError: r.IsError,
+		Meta:    r.Meta,
+	}
 }
 
 func ResultError(output string) *ToolCallResult {

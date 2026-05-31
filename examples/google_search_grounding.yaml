@@ -1,9 +1,7 @@
-#!/usr/bin/env docker agent run
-
 models:
   gemini:
     provider: google
-    model: gemini-3.1-flash-lite-preview
+    model: gemini-3.1-flash-lite
     provider_opts:
       google_search: true
 

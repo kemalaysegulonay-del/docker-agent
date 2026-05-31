@@ -1,7 +1,6 @@
 package root
 
 import (
-	"errors"
 	"fmt"
 	"maps"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 
 	"github.com/docker/docker-agent/pkg/cli"
 	"github.com/docker/docker-agent/pkg/config"
-	"github.com/docker/docker-agent/pkg/paths"
+	pathx "github.com/docker/docker-agent/pkg/path"
 	"github.com/docker/docker-agent/pkg/telemetry"
 	"github.com/docker/docker-agent/pkg/userconfig"
 )
@@ -48,6 +47,7 @@ type aliasAddFlags struct {
 	yolo            bool
 	model           string
 	hideToolResults bool
+	sandbox         bool
 }
 
 func newAliasAddCmd() *cobra.Command {
@@ -63,7 +63,8 @@ the alias is used:
 
   --yolo               Automatically approve all tool calls without prompting
   --model              Override the agent's model (format: [agent=]provider/model)
-  --hide-tool-results  Hide tool call results in the TUI`,
+  --hide-tool-results  Hide tool call results in the TUI
+  --sandbox            Always run the agent inside a Docker sandbox`,
 		Example: `  # Create a simple alias
   docker-agent alias add code agentcatalog/notion-expert
 
@@ -76,6 +77,9 @@ the alias is used:
   # Create an alias with hidden tool results
   docker-agent alias add quiet agentcatalog/coder --hide-tool-results
 
+  # Create an alias that always runs in a sandbox
+  docker-agent alias add safe-coder agentcatalog/coder --sandbox
+
   # Create an alias with multiple options
   docker-agent alias add turbo agentcatalog/coder --yolo --model anthropic/claude-sonnet-4-0`,
 		Args: cobra.ExactArgs(2),
@@ -87,6 +91,7 @@ the alias is used:
 	cmd.Flags().BoolVar(&flags.yolo, "yolo", false, "Automatically approve all tool calls without prompting")
 	cmd.Flags().StringVar(&flags.model, "model", "", "Override agent model (format: [agent=]provider/model)")
 	cmd.Flags().BoolVar(&flags.hideToolResults, "hide-tool-results", false, "Hide tool call results in the TUI")
+	cmd.Flags().BoolVar(&flags.sandbox, "sandbox", false, "Always run the agent inside a Docker sandbox")
 
 	return cmd
 }
@@ -121,14 +126,12 @@ func runAliasAddCommand(cmd *cobra.Command, args []string, flags *aliasAddFlags)
 	name := args[0]
 	agentPath := args[1]
 
-	// Load existing config
 	cfg, err := userconfig.Load()
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Expand tilde in path if present
-	absAgentPath, err := expandTilde(agentPath)
+	absAgentPath, err := pathx.ExpandHomeDir(agentPath)
 	if err != nil {
 		return err
 	}
@@ -147,6 +150,7 @@ func runAliasAddCommand(cmd *cobra.Command, args []string, flags *aliasAddFlags)
 		Yolo:            flags.yolo,
 		Model:           flags.model,
 		HideToolResults: flags.hideToolResults,
+		Sandbox:         flags.sandbox,
 	}
 
 	// Store the alias
@@ -170,6 +174,9 @@ func runAliasAddCommand(cmd *cobra.Command, args []string, flags *aliasAddFlags)
 	}
 	if flags.hideToolResults {
 		out.Printf("  Hide tool results: enabled\n")
+	}
+	if flags.sandbox {
+		out.Printf("  Sandbox: enabled\n")
 	}
 
 	if name == "default" {
@@ -227,6 +234,9 @@ func runAliasListCommand(cmd *cobra.Command, args []string) (commandErr error) {
 		if alias.HideToolResults {
 			options = append(options, "hide-tool-results")
 		}
+		if alias.Sandbox {
+			options = append(options, "sandbox")
+		}
 
 		if len(options) > 0 {
 			out.Printf("  %s%s → %s [%s]\n", name, padding, alias.Path, strings.Join(options, ", "))
@@ -264,18 +274,4 @@ func runAliasRemoveCommand(cmd *cobra.Command, args []string) (commandErr error)
 
 	out.Printf("Alias '%s' removed successfully\n", name)
 	return nil
-}
-
-// expandTilde expands the tilde in a path to the user's home directory
-func expandTilde(path string) (string, error) {
-	if !strings.HasPrefix(path, "~/") {
-		return path, nil
-	}
-
-	homeDir := paths.GetHomeDir()
-	if homeDir == "" {
-		return "", errors.New("failed to get user home directory")
-	}
-
-	return filepath.Join(homeDir, strings.TrimPrefix(path, "~/")), nil
 }

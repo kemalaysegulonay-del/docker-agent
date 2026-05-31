@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/environment"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -25,7 +26,7 @@ func TestConvertMessages_UserText(t *testing.T) {
 		Content: "Hello, world!",
 	}}
 
-	bedrockMsgs, system := convertMessages(msgs, false)
+	bedrockMsgs, system := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	require.Len(t, bedrockMsgs, 1)
 	assert.Empty(t, system)
@@ -45,7 +46,7 @@ func TestConvertMessages_SystemExtraction(t *testing.T) {
 		{Role: chat.MessageRoleUser, Content: "Hi"},
 	}
 
-	bedrockMsgs, system := convertMessages(msgs, false)
+	bedrockMsgs, system := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	require.Len(t, bedrockMsgs, 1) // Only user message
 	require.Len(t, system, 1)      // System extracted
@@ -70,7 +71,7 @@ func TestConvertMessages_AssistantWithToolCalls(t *testing.T) {
 		}},
 	}}
 
-	bedrockMsgs, _ := convertMessages(msgs, false)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	require.Len(t, bedrockMsgs, 1)
 	require.Len(t, bedrockMsgs[0].Content, 1)
@@ -91,7 +92,7 @@ func TestConvertMessages_ToolResult(t *testing.T) {
 		Content:    "Weather is sunny",
 	}}
 
-	bedrockMsgs, _ := convertMessages(msgs, false)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	require.Len(t, bedrockMsgs, 1)
 	assert.Equal(t, types.ConversationRoleUser, bedrockMsgs[0].Role)
@@ -105,13 +106,19 @@ func TestConvertMessages_ToolResult(t *testing.T) {
 func TestConvertMessages_EmptyContent(t *testing.T) {
 	t.Parallel()
 
+	// Whitespace-only messages are filtered by session.normalizeMessageContent
+	// before they reach the provider converter, so the converter itself no longer
+	// needs to guard against them. This test documents that the converter passes
+	// them through as-is (empty content blocks); it is the session layer's job
+	// to ensure such messages never arrive here.
 	msgs := []chat.Message{
 		{Role: chat.MessageRoleUser, Content: ""},
 		{Role: chat.MessageRoleUser, Content: "   "},
 	}
 
-	bedrockMsgs, _ := convertMessages(msgs, false)
-	assert.Empty(t, bedrockMsgs)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
+	// Both messages now produce user turns with empty or whitespace content blocks.
+	assert.Len(t, bedrockMsgs, 2)
 }
 
 func TestConvertToolConfig(t *testing.T) {
@@ -175,7 +182,7 @@ func TestConvertMessages_MultiContent(t *testing.T) {
 		},
 	}}
 
-	bedrockMsgs, _ := convertMessages(msgs, false)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	require.Len(t, bedrockMsgs, 1)
 	require.Len(t, bedrockMsgs[0].Content, 2)
@@ -199,7 +206,7 @@ func TestConvertMessages_ConsecutiveToolResults(t *testing.T) {
 		{Role: chat.MessageRoleUser, Content: "Continue"},
 	}
 
-	bedrockMsgs, _ := convertMessages(msgs, false)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	// Expect: user, assistant, user (grouped tool results), user
 	require.Len(t, bedrockMsgs, 4)
@@ -247,7 +254,9 @@ func TestBearerTokenTransport(t *testing.T) {
 
 	// Make a request through the transport
 	client := &http.Client{Transport: transport}
-	resp, err := client.Get(server.URL)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
+	require.NoError(t, err)
+	resp, err := client.Do(req)
 	require.NoError(t, err)
 	defer resp.Body.Close()
 
@@ -1128,7 +1137,7 @@ func TestConvertMessages_WithCaching(t *testing.T) {
 		{Role: chat.MessageRoleUser, Content: "How are you?"},
 	}
 
-	bedrockMsgs, system := convertMessages(msgs, true)
+	bedrockMsgs, system := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), true)
 
 	// System should have text block + cache point
 	require.Len(t, system, 2)
@@ -1159,7 +1168,7 @@ func TestConvertMessages_WithoutCaching(t *testing.T) {
 		{Role: chat.MessageRoleUser, Content: "Hello"},
 	}
 
-	bedrockMsgs, system := convertMessages(msgs, false)
+	bedrockMsgs, system := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), false)
 
 	// System should only have text block, no cache point
 	require.Len(t, system, 1)
@@ -1225,24 +1234,33 @@ func TestPromptCachingEnabled_TypeMismatch(t *testing.T) {
 func TestDetectCachingSupport_SupportedModel(t *testing.T) {
 	t.Parallel()
 
+	store, err := modelsdev.NewStore()
+	require.NoError(t, err)
+
 	// Uses real models.dev lookup to verify Claude models support caching
-	supported := detectCachingSupport(t.Context(), "anthropic.claude-3-5-sonnet-20241022-v2:0")
+	supported := detectCachingSupport(t.Context(), "anthropic.claude-opus-4-7", store)
 	assert.True(t, supported)
 }
 
 func TestDetectCachingSupport_UnsupportedModel(t *testing.T) {
 	t.Parallel()
 
+	store, err := modelsdev.NewStore()
+	require.NoError(t, err)
+
 	// Llama doesn't have cache pricing in models.dev
-	supported := detectCachingSupport(t.Context(), "meta.llama3-8b-instruct-v1:0")
+	supported := detectCachingSupport(t.Context(), "meta.llama3-8b-instruct-v1:0", store)
 	assert.False(t, supported)
 }
 
 func TestDetectCachingSupport_UnknownModel(t *testing.T) {
 	t.Parallel()
 
+	store, err := modelsdev.NewStore()
+	require.NoError(t, err)
+
 	// Unknown model should gracefully return false, not panic
-	supported := detectCachingSupport(t.Context(), "nonexistent.model.that.does.not.exist:v1")
+	supported := detectCachingSupport(t.Context(), "nonexistent.model.that.does.not.exist:v1", store)
 	assert.False(t, supported)
 }
 
@@ -1250,7 +1268,7 @@ func TestConvertMessages_EmptyWithCaching(t *testing.T) {
 	t.Parallel()
 
 	// Empty message list should not panic with caching enabled
-	bedrockMsgs, system := convertMessages([]chat.Message{}, true)
+	bedrockMsgs, system := convertMessages(t.Context(), []chat.Message{}, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), true)
 
 	assert.Empty(t, bedrockMsgs)
 	assert.Empty(t, system)
@@ -1263,7 +1281,7 @@ func TestConvertMessages_SingleMessageWithCaching(t *testing.T) {
 		{Role: chat.MessageRoleUser, Content: "Hello"},
 	}
 
-	bedrockMsgs, _ := convertMessages(msgs, true)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), true)
 
 	require.Len(t, bedrockMsgs, 1)
 	// Single message should get a cache point appended
@@ -1283,7 +1301,7 @@ func TestConvertMessages_MultiContentWithCaching(t *testing.T) {
 		},
 	}}
 
-	bedrockMsgs, _ := convertMessages(msgs, true)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), true)
 
 	require.Len(t, bedrockMsgs, 1)
 	// 2 text blocks + cache point = 3 content blocks
@@ -1306,7 +1324,7 @@ func TestConvertMessages_ToolResultWithCaching(t *testing.T) {
 		{Role: chat.MessageRoleTool, ToolCallID: "tool-1", Content: "Result"},
 	}
 
-	bedrockMsgs, _ := convertMessages(msgs, true)
+	bedrockMsgs, _ := convertMessages(t.Context(), msgs, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}), true)
 
 	// Expect: user, assistant, user (tool result)
 	require.Len(t, bedrockMsgs, 3)

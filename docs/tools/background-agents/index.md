@@ -21,6 +21,24 @@ The background agents tool lets an orchestrator dispatch work to sub-agents conc
 | `view_background_agent`  | View live output or final result of a task by ID                |
 | `stop_background_agent`  | Cancel a running task by ID                                     |
 
+### `run_background_agent` parameters
+
+| Parameter         | Type   | Required | Description                                                                 |
+| ----------------- | ------ | -------- | --------------------------------------------------------------------------- |
+| `agent`           | string | ✓        | Name of the sub-agent to run. Must be listed under the caller's `sub_agents`. |
+| `task`            | string | ✓        | Clear, concise description of the task the sub-agent should achieve.        |
+| `expected_output` | string | ✗        | Optional description of the result format the caller expects.               |
+
+`run_background_agent` returns a **task ID** string. Tools run by the sub-agent are pre-approved, so only dispatch to trusted sub-agents with well-scoped tasks.
+
+### `view_background_agent` and `stop_background_agent` parameters
+
+| Parameter | Type   | Required | Description                                                    |
+| --------- | ------ | -------- | -------------------------------------------------------------- |
+| `task_id` | string | ✓        | Task ID returned by `run_background_agent` or `list_background_agents`. |
+
+`list_background_agents` takes no parameters.
+
 ## Configuration
 
 ```yaml
@@ -53,7 +71,7 @@ agents:
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 When to Use
+<div class="callout-title">When to Use
 </div>
   <p>Use <code>background_agents</code> when your orchestrator needs to fan out work to multiple specialists in parallel — for example, researching several topics simultaneously or running independent code analyses side by side.</p>
 </div>

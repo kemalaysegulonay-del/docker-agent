@@ -26,35 +26,58 @@ const (
 // Store manages access to the models.dev data.
 // All methods are safe for concurrent use.
 //
-// Use NewStore to obtain the process-wide singleton instance.
 // The database is loaded on first access via GetDatabase and
-// shared across all callers, avoiding redundant disk/network I/O.
+// then cached in memory for the lifetime of the Store.
 type Store struct {
 	cacheFile string
 	mu        sync.Mutex
 	db        *Database
 }
 
-// NewStore returns the process-wide singleton Store.
-//
-// The database is loaded lazily on the first call to GetDatabase and
-// then cached in memory so that every caller shares one copy.
-// The first call creates the cache directory if it does not exist.
-var NewStore = sync.OnceValues(func() (*Store, error) {
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user home directory: %w", err)
+// Opt configures a Store created with NewStore.
+type Opt func(*storeOptions)
+
+type storeOptions struct {
+	cacheFile string
+}
+
+// WithCache overrides the path of the on-disk cache file used by the Store.
+// The parent directory will be created if it does not already exist.
+func WithCache(path string) Opt {
+	return func(o *storeOptions) {
+		o.cacheFile = path
+	}
+}
+
+// NewStore creates a new Store backed by an on-disk cache. By default the
+// cache lives at ~/.cagent/models_dev.json; use WithCache to override the
+// location.
+// Callers should create one Store and share it rather than calling NewStore
+// repeatedly. RuntimeConfig.ModelsDevStore() is the standard way to obtain
+// a shared instance.
+func NewStore(opts ...Opt) (*Store, error) {
+	var options storeOptions
+	for _, opt := range opts {
+		opt(&options)
 	}
 
-	cacheDir := filepath.Join(homeDir, ".cagent")
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+	cacheFile := options.cacheFile
+	if cacheFile == "" {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("failed to get user home directory: %w", err)
+		}
+		cacheFile = filepath.Join(homeDir, ".cagent", CacheFileName)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(cacheFile), 0o700); err != nil {
 		return nil, fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	return &Store{
-		cacheFile: filepath.Join(cacheDir, CacheFileName),
+		cacheFile: cacheFile,
 	}, nil
-})
+}
 
 // NewDatabaseStore creates a Store pre-populated with the given database.
 // The returned store serves data entirely from memory and never fetches
@@ -97,33 +120,32 @@ func (s *Store) getProvider(ctx context.Context, providerID string) (*Provider, 
 	return &provider, nil
 }
 
-// GetModel returns a specific model by provider ID and model ID.
-func (s *Store) GetModel(ctx context.Context, id string) (*Model, error) {
-	parts := strings.SplitN(id, "/", 2)
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid model ID: %q", id)
+// GetModel returns a specific model by ID. The ID must carry both a
+// provider and a model component; pass the result of [NewID], [ParseID],
+// or a provider's [ID] method.
+func (s *Store) GetModel(ctx context.Context, id ID) (*Model, error) {
+	if !id.IsValid() {
+		return nil, fmt.Errorf("invalid model ID: %q", id.String())
 	}
-	providerID := parts[0]
-	modelID := parts[1]
 
-	provider, err := s.getProvider(ctx, providerID)
+	provider, err := s.getProvider(ctx, id.Provider)
 	if err != nil {
 		return nil, err
 	}
 
-	model, exists := provider.Models[modelID]
+	model, exists := provider.Models[id.Model]
 
 	// For amazon-bedrock, try stripping region/inference profile prefixes.
 	// Bedrock uses prefixes for cross-region inference profiles,
 	// but models.dev stores models without these prefixes.
-	if !exists && providerID == "amazon-bedrock" {
-		if prefix, after, ok := strings.Cut(modelID, "."); ok && bedrockRegionPrefixes[prefix] {
+	if !exists && id.Provider == "amazon-bedrock" {
+		if prefix, after, ok := strings.Cut(id.Model, "."); ok && bedrockRegionPrefixes[prefix] {
 			model, exists = provider.Models[after]
 		}
 	}
 
 	if !exists {
-		return nil, fmt.Errorf("model %q not found in provider %q", modelID, providerID)
+		return nil, fmt.Errorf("model %q not found in provider %q", id.Model, id.Provider)
 	}
 
 	return &model, nil
@@ -148,7 +170,7 @@ func loadDatabase(ctx context.Context, cacheFile string) (*Database, error) {
 	if fetchErr != nil {
 		// If API fetch fails but we have cached data, use it regardless of age.
 		if cached != nil {
-			slog.Debug("API fetch failed, using stale cache", "error", fetchErr)
+			slog.DebugContext(ctx, "API fetch failed, using stale cache", "error", fetchErr)
 			return &cached.Database, nil
 		}
 		return nil, fmt.Errorf("failed to fetch from API and no cached data available: %w", fetchErr)
@@ -159,14 +181,14 @@ func loadDatabase(ctx context.Context, cacheFile string) (*Database, error) {
 		// Bump LastRefresh so we don't re-check until the next interval.
 		cached.LastRefresh = time.Now()
 		if saveErr := saveToCache(cacheFile, &cached.Database, cached.ETag); saveErr != nil {
-			slog.Warn("Failed to update cache timestamp", "error", saveErr)
+			slog.WarnContext(ctx, "Failed to update cache timestamp", "error", saveErr)
 		}
 		return &cached.Database, nil
 	}
 
 	// Save the fresh data to cache.
 	if saveErr := saveToCache(cacheFile, database, newETag); saveErr != nil {
-		slog.Warn("Failed to save to cache", "error", saveErr)
+		slog.WarnContext(ctx, "Failed to save to cache", "error", saveErr)
 	}
 
 	return database, nil
@@ -192,7 +214,7 @@ func fetchFromAPI(ctx context.Context, etag string) (*Database, string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotModified {
-		slog.Debug("models.dev data not modified (304)")
+		slog.DebugContext(ctx, "models.dev data not modified (304)")
 		return nil, etag, nil
 	}
 
@@ -245,7 +267,7 @@ func saveToCache(cacheFile string, database *Database, etag string) error {
 		return fmt.Errorf("failed to marshal cached data: %w", err)
 	}
 
-	if err := os.WriteFile(cacheFile, data, 0o644); err != nil {
+	if err := os.WriteFile(cacheFile, data, 0o600); err != nil {
 		return fmt.Errorf("failed to write cache file: %w", err)
 	}
 

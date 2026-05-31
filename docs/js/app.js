@@ -12,66 +12,144 @@ const $searchResults = document.getElementById('search-results');
 
 // ---------- Theme ----------
 function initTheme() {
-  const saved = localStorage.getItem('cagent-docs-theme');
-  const theme = saved || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : null);
-  if (theme) document.documentElement.setAttribute('data-theme', theme);
+  const saved = localStorage.getItem('docker-agent-docs-theme');
+  if (saved === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+  } else if (!saved && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
+    document.documentElement.setAttribute('data-theme', 'light');
+  }
+  // Dark is the default — no attribute needed (CSS :root is dark)
 }
 
 function toggleTheme() {
-  const next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
-  document.documentElement.setAttribute('data-theme', next);
-  localStorage.setItem('cagent-docs-theme', next);
+  const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+  if (isLight) {
+    document.documentElement.removeAttribute('data-theme');
+    localStorage.setItem('docker-agent-docs-theme', 'dark');
+  } else {
+    document.documentElement.setAttribute('data-theme', 'light');
+    localStorage.setItem('docker-agent-docs-theme', 'light');
+  }
 }
 
 // ---------- Table of Contents ----------
-function slugify(text) {
-  return text.toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^-|-$/g, '');
-}
-
+// The right-column aside on each page contains:
+//   1. An "Edit this page" link to the source on GitHub (resolved
+//      from a <meta name="docs-edit-url"> set in the layout).
+//   2. A "Table of contents" heading + nested links to in-page
+//      <h2 id> / <h3 id> headings.
+// We render the heading + nav unconditionally when there are at least
+// 2 headings; the edit link renders even on short pages.
+//
+// Built programmatically (createElement + textContent) rather than via
+// innerHTML so that heading text — which is authored by humans and may
+// contain stray HTML metacharacters — is treated as text and never
+// reinterpreted as markup (CodeQL: "DOM text reinterpreted as HTML").
 function buildTOC() {
   if (!$content) return;
 
   const headings = $content.querySelectorAll('h2[id], h3[id]');
-  if (headings.length < 3) return;
+  const editUrl = (document.querySelector('meta[name="docs-edit-url"]') || {}).content || '';
+
+  if (headings.length < 2 && !editUrl) return;
 
   const aside = document.createElement('aside');
   aside.className = 'toc-aside';
-  aside.setAttribute('aria-label', 'Table of contents');
-  aside.innerHTML = `
-    <div class="toc-inner">
-      <div class="toc-title">On this page</div>
-      <nav class="toc-nav">
-        ${Array.from(headings).map(h => {
-          const level = h.tagName === 'H3' ? 'toc-h3' : '';
-          return `<a class="toc-link ${level}" href="#${h.id}" data-id="${h.id}">${h.textContent}</a>`;
-        }).join('')}
-      </nav>
-    </div>`;
+  aside.setAttribute('aria-label', 'On this page');
+
+  const inner = document.createElement('div');
+  inner.className = 'toc-inner';
+  aside.appendChild(inner);
+
+  // "Edit this page" — only when an edit URL was provided.
+  if (editUrl) {
+    const actions = document.createElement('div');
+    actions.className = 'toc-actions';
+
+    const link = document.createElement('a');
+    link.className = 'toc-action';
+    link.href = editUrl;
+    link.target = '_blank';
+    link.rel = 'noopener';
+
+    // Pencil icon (Lucide-style line). Reusing one literal here is
+    // fine because no untrusted data is interpolated into it.
+    link.insertAdjacentHTML('afterbegin',
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"' +
+      ' stroke-width="2" stroke-linecap="round" stroke-linejoin="round"' +
+      ' aria-hidden="true">' +
+      '<path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>' +
+      '<path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>' +
+      '</svg>');
+
+    const label = document.createElement('span');
+    label.textContent = 'Edit this page';
+    link.appendChild(label);
+
+    actions.appendChild(link);
+    inner.appendChild(actions);
+  }
+
+  // "Table of contents" + nav — only when there are enough headings.
+  if (headings.length >= 2) {
+    const heading = document.createElement('div');
+    heading.className = 'toc-heading';
+    heading.textContent = 'Table of contents';
+    inner.appendChild(heading);
+
+    const nav = document.createElement('nav');
+    nav.className = 'toc-nav';
+    inner.appendChild(nav);
+
+    for (const h of headings) {
+      const a = document.createElement('a');
+      a.className = 'toc-link' + (h.tagName === 'H3' ? ' toc-h3' : '');
+      a.href = '#' + h.id;
+      a.dataset.id = h.id;
+      a.textContent = h.textContent;
+      nav.appendChild(a);
+    }
+
+    aside.addEventListener('click', (e) => {
+      const a = e.target.closest('.toc-link');
+      if (!a) return;
+      e.preventDefault();
+      const target = document.getElementById(a.dataset.id);
+      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    setupScrollSpy(headings, aside);
+  }
 
   const main = document.querySelector('.main');
   if (main) main.appendChild(aside);
-
-  aside.addEventListener('click', (e) => {
-    const link = e.target.closest('.toc-link');
-    if (!link) return;
-    e.preventDefault();
-    const target = document.getElementById(link.dataset.id);
-    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  });
-
-  setupScrollSpy(headings, aside);
 }
 
 function setupScrollSpy(headings, aside) {
+  let currentActive = null;
+  const visibleIds = new Set();
+  const tocLinks = aside.querySelectorAll('.toc-link');
+
   const observer = new IntersectionObserver((entries) => {
     for (const entry of entries) {
       if (entry.isIntersecting) {
-        aside.querySelectorAll('.toc-link').forEach(l => l.classList.remove('active'));
-        aside.querySelector(`.toc-link[data-id="${entry.target.id}"]`)?.classList.add('active');
+        visibleIds.add(entry.target.id);
+      } else {
+        visibleIds.delete(entry.target.id);
+      }
+    }
+
+    // Pick the first heading (in DOM order) that is currently visible
+    let nextActive = null;
+    for (const h of headings) {
+      if (visibleIds.has(h.id)) { nextActive = h.id; break; }
+    }
+
+    if (nextActive !== currentActive) {
+      currentActive = nextActive;
+      tocLinks.forEach(l => l.classList.remove('active'));
+      if (currentActive) {
+        aside.querySelector(`.toc-link[data-id="${currentActive}"]`)?.classList.add('active');
       }
     }
   }, { rootMargin: '-80px 0px -70% 0px', threshold: 0 });
@@ -82,19 +160,27 @@ function setupScrollSpy(headings, aside) {
 // ---------- Copy buttons ----------
 function addCopyButtons() {
   if (!$content) return;
-  // Target both direct <pre> and Rouge-generated pre.highlight
+  const seen = new WeakSet();
   $content.querySelectorAll('pre, pre.highlight').forEach(pre => {
+    if (seen.has(pre)) return;
     if (pre.querySelector('.copy-btn')) return;
-    // Skip if this pre is inside a .highlight div that already has a button
-    if (pre.closest('.highlight')?.querySelector('.copy-btn')) return;
+    const parent = pre.parentElement;
+    if (parent?.classList.contains('highlight') && parent.querySelector('.copy-btn')) return;
+    seen.add(pre);
+
     const btn = document.createElement('button');
     btn.className = 'copy-btn';
     btn.textContent = 'Copy';
     btn.setAttribute('aria-label', 'Copy code to clipboard');
     btn.addEventListener('click', async () => {
-      await navigator.clipboard.writeText(pre.querySelector('code')?.textContent || pre.textContent);
-      btn.textContent = 'Copied!';
-      btn.classList.add('copied');
+      try {
+        const text = pre.querySelector('code')?.textContent ?? pre.textContent;
+        await navigator.clipboard.writeText(text);
+        btn.textContent = 'Copied!';
+        btn.classList.add('copied');
+      } catch {
+        btn.textContent = 'Failed';
+      }
       setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('copied'); }, 2000);
     });
     pre.style.position = 'relative';
@@ -103,27 +189,27 @@ function addCopyButtons() {
 }
 
 // ---------- Search ----------
-// Build a search index from sidebar links and page content
 const searchIndex = [];
 
 function buildSearchIndex() {
-  // Index from sidebar navigation
-  document.querySelectorAll('.sidebar-link').forEach(link => {
+  const sidebarLinks = document.querySelectorAll('.sidebar-link');
+  sidebarLinks.forEach(link => {
+    const href = link.getAttribute('href');
+    if (!href) return;
     const section = link.closest('.sidebar-section')?.querySelector('.sidebar-heading')?.textContent || '';
     searchIndex.push({
       title: link.textContent.trim(),
-      url: link.getAttribute('href'),
+      url: href,
       section: section,
       searchText: `${link.textContent} ${section}`.toLowerCase(),
     });
   });
 
-  // Also index current page content for richer results
   if ($content) {
-    const currentEntry = searchIndex.find(e => {
-      const currentPath = window.location.pathname;
-      return currentPath.endsWith(e.url) || currentPath.endsWith(e.url.replace(/\/$/, ''));
-    });
+    const currentPath = window.location.pathname;
+    const currentEntry = searchIndex.find(e =>
+      currentPath.endsWith(e.url) || currentPath.endsWith(e.url.replace(/\/$/, ''))
+    );
     if (currentEntry) {
       currentEntry.searchText += ' ' + $content.textContent.replace(/\s+/g, ' ').toLowerCase();
     }
@@ -169,7 +255,6 @@ function renderSearchResults(query) {
     return;
   }
 
-  // Group results by section to avoid repeating section names
   let html = '';
   let lastSection = '';
   for (const r of results) {
@@ -212,11 +297,18 @@ function restoreSidebarScroll() {
     sidebar.scrollTop = parseInt(saved, 10);
   }
 
-  // Before navigating away, save the current scroll position
   sidebar.querySelectorAll('a').forEach(link => {
     link.addEventListener('click', () => {
       sessionStorage.setItem('sidebar-scroll', sidebar.scrollTop);
     });
+  });
+}
+
+// ---------- Bind buttons (no inline handlers) ----------
+function bindButtons() {
+  document.getElementById('theme-toggle')?.addEventListener('click', toggleTheme);
+  document.querySelector('.sidebar-toggle')?.addEventListener('click', () => {
+    document.getElementById('sidebar')?.classList.toggle('open');
   });
 }
 
@@ -226,3 +318,4 @@ restoreSidebarScroll();
 buildSearchIndex();
 buildTOC();
 addCopyButtons();
+bindButtons();

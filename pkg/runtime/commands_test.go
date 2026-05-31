@@ -10,7 +10,7 @@ import (
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/sessiontitle"
 	"github.com/docker/docker-agent/pkg/tools"
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	skillstool "github.com/docker/docker-agent/pkg/tools/builtin/skills"
 	mcptools "github.com/docker/docker-agent/pkg/tools/mcp"
 )
 
@@ -23,7 +23,9 @@ type mockRuntime struct {
 func (m *mockRuntime) CurrentAgentTools(context.Context) ([]tools.Tool, error) {
 	return m.tools, nil
 }
-func (m *mockRuntime) CurrentAgentName() string { return "test" }
+func (m *mockRuntime) CurrentAgentName() string                           { return "test" }
+func (m *mockRuntime) CurrentAgentToolsetStatuses() []tools.ToolsetStatus { return nil }
+func (m *mockRuntime) RestartToolset(context.Context, string) error       { return nil }
 func (m *mockRuntime) CurrentAgentInfo(context.Context) CurrentAgentInfo {
 	return CurrentAgentInfo{
 		Name:        "test",
@@ -35,8 +37,8 @@ func (m *mockRuntime) CurrentAgentInfo(context.Context) CurrentAgentInfo {
 func (m *mockRuntime) SetCurrentAgent(string) error {
 	return nil
 }
-func (m *mockRuntime) EmitStartupInfo(context.Context, *session.Session, chan Event) {}
-func (m *mockRuntime) ResetStartupInfo()                                             {}
+func (m *mockRuntime) EmitStartupInfo(context.Context, *session.Session, EventSink) {}
+func (m *mockRuntime) ResetStartupInfo()                                            {}
 func (m *mockRuntime) RunStream(context.Context, *session.Session) <-chan Event {
 	return nil
 }
@@ -49,11 +51,15 @@ func (m *mockRuntime) ResumeElicitation(context.Context, tools.ElicitationAction
 	return nil
 }
 func (m *mockRuntime) SessionStore() session.Store { return nil }
-func (m *mockRuntime) Summarize(context.Context, *session.Session, string, chan Event) {
+func (m *mockRuntime) Summarize(context.Context, *session.Session, string, EventSink) {
 }
 func (m *mockRuntime) PermissionsInfo() *PermissionsInfo { return nil }
-func (m *mockRuntime) CurrentAgentSkillsToolset() *builtin.SkillsToolset {
+func (m *mockRuntime) CurrentAgentSkillsToolset() *skillstool.ToolSet {
 	return nil
+}
+
+func (m *mockRuntime) RunSkillFork(context.Context, *session.Session, skillstool.RunSkillArgs, EventSink) (*tools.ToolCallResult, error) {
+	return nil, nil
 }
 
 func (m *mockRuntime) CurrentMCPPrompts(context.Context) map[string]mcptools.PromptInfo {
@@ -67,10 +73,16 @@ func (m *mockRuntime) ExecuteMCPPrompt(context.Context, string, map[string]strin
 func (m *mockRuntime) UpdateSessionTitle(context.Context, *session.Session, string) error {
 	return nil
 }
-func (m *mockRuntime) TitleGenerator() *sessiontitle.Generator { return nil }
-func (m *mockRuntime) Close() error                            { return nil }
-func (m *mockRuntime) Steer(QueuedMessage) error               { return nil }
-func (m *mockRuntime) FollowUp(QueuedMessage) error            { return nil }
+func (m *mockRuntime) TitleGenerator() *sessiontitle.Generator             { return nil }
+func (m *mockRuntime) Close() error                                        { return nil }
+func (m *mockRuntime) Steer(QueuedMessage) error                           { return nil }
+func (m *mockRuntime) FollowUp(QueuedMessage) error                        { return nil }
+func (m *mockRuntime) QueueStatus() QueueStatus                            { return QueueStatus{} }
+func (m *mockRuntime) TogglePause(context.Context) (bool, error)           { return false, nil }
+func (m *mockRuntime) SetAgentModel(context.Context, string, string) error { return nil }
+func (m *mockRuntime) AvailableModels(context.Context) []ModelChoice       { return nil }
+func (m *mockRuntime) SupportsModelSwitching() bool                        { return false }
+func (m *mockRuntime) OnToolsChanged(func(Event))                          {}
 
 func (m *mockRuntime) RegenerateTitle(context.Context, *session.Session, chan Event) {
 }
@@ -614,4 +626,65 @@ func TestResolveCommand_ArgsSlice(t *testing.T) {
 
 	result := ResolveCommand(t.Context(), rt, "/test first second third")
 	assert.Equal(t, "Rest: second third", result)
+}
+
+func TestLookupCommand_AgentTarget(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntime{
+		commands: types.Commands{
+			"plan": types.Command{
+				Description: "Hand off to the planner",
+				Agent:       "planner",
+			},
+		},
+	}
+
+	cmd, rest, ok := LookupCommand(t.Context(), rt, "/plan add a logout button")
+	assert.True(t, ok)
+	assert.Equal(t, "planner", cmd.Agent)
+	assert.Empty(t, cmd.Instruction)
+	assert.Equal(t, "add a logout button", rest)
+}
+
+func TestLookupCommand_NotACommand(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntime{commands: types.Commands{}}
+
+	_, _, ok := LookupCommand(t.Context(), rt, "hello there")
+	assert.False(t, ok)
+}
+
+func TestResolveCommand_AgentOnlyForwardsArgs(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntime{
+		commands: types.Commands{
+			"plan": types.Command{Agent: "planner"},
+		},
+	}
+
+	// With trailing args: forward verbatim to the target agent.
+	assert.Equal(t, "design a login flow", ResolveCommand(t.Context(), rt, "/plan design a login flow"))
+	// Without trailing args: empty so no message is sent after the switch.
+	assert.Empty(t, ResolveCommand(t.Context(), rt, "/plan"))
+}
+
+func TestResolveCommand_AgentWithInstruction(t *testing.T) {
+	t.Parallel()
+
+	rt := &mockRuntime{
+		commands: types.Commands{
+			"plan": types.Command{
+				Instruction: "Plan the work for: ${args.join(\" \")}",
+				Agent:       "planner",
+			},
+		},
+	}
+
+	// When both instruction and agent are set, the instruction wins (the
+	// caller is responsible for switching the agent before sending it).
+	result := ResolveCommand(t.Context(), rt, "/plan add login")
+	assert.Equal(t, "Plan the work for: add login", result)
 }

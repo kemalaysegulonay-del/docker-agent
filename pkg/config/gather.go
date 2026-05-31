@@ -53,8 +53,11 @@ func gatherMissingEnvVars(ctx context.Context, cfg *latest.Config, modelsGateway
 func GatherEnvVarsForModels(cfg *latest.Config) []string {
 	requiredEnv := map[string]bool{}
 
-	// Inspect only the models that are actually used by agents
+	// Inspect only the models that are actually used by docker-agent model-backed agents.
 	for _, agent := range cfg.Agents {
+		if agent.Harness != nil {
+			continue
+		}
 		modelNames := strings.SplitSeq(agent.Model, ",")
 		for modelName := range modelNames {
 			modelName = strings.TrimSpace(modelName)
@@ -90,6 +93,16 @@ func gatherEnvVarsForModel(cfg *latest.Config, modelName string, requiredEnv map
 // addEnvVarsForModelConfig adds required environment variables for a model config.
 // It checks custom providers first, then built-in aliases, then hardcoded fallbacks.
 func addEnvVarsForModelConfig(model *latest.ModelConfig, customProviders map[string]latest.ProviderConfig, requiredEnv map[string]bool) {
+	// A model with non-API-key auth (e.g. Workload Identity Federation) does
+	// not require a TokenKey or the hardcoded API-key env var. Instead, the
+	// env vars referenced by its identity-token source are required.
+	if auth := latest.EffectiveAuth(*model, customProviders); auth != nil {
+		for _, name := range auth.EnvVars() {
+			requiredEnv[name] = true
+		}
+		return
+	}
+
 	if model.TokenKey != "" {
 		requiredEnv[model.TokenKey] = true
 	} else if customProviders != nil {
@@ -106,7 +119,7 @@ func addEnvVarsForModelConfig(model *latest.ModelConfig, customProviders map[str
 				addEnvVarsForCoreProvider(effective, model, requiredEnv)
 			}
 		}
-	} else if alias, exists := provider.Aliases[model.Provider]; exists {
+	} else if alias, exists := provider.LookupAlias(model.Provider); exists {
 		// Check built-in aliases
 		if alias.TokenEnvVar != "" {
 			requiredEnv[alias.TokenEnvVar] = true

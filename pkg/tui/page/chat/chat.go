@@ -1,12 +1,9 @@
 package chat
 
 import (
-	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
-	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -139,8 +136,9 @@ type chatPage struct {
 	sessionState *service.SessionState
 
 	// State
-	working  bool
-	leanMode bool
+	working     bool
+	leanMode    bool
+	hideSidebar bool
 
 	msgCancel       context.CancelFunc
 	streamCancelled bool
@@ -174,12 +172,18 @@ type chatPage struct {
 	sidebarDragMoved      bool // True if mouse moved beyond threshold during drag
 }
 
+// sidebarHidden reports whether the sidebar should be omitted entirely from
+// layout and rendering (lean mode or explicit --sidebar=false).
+func (p *chatPage) sidebarHidden() bool {
+	return p.leanMode || p.hideSidebar
+}
+
 // computeSidebarLayout calculates the layout based on current state.
 func (p *chatPage) computeSidebarLayout() sidebarLayout {
 	innerWidth := p.width - appPaddingHorizontal
 
-	// Lean mode: no sidebar at all
-	if p.leanMode {
+	// No sidebar at all (lean mode or hideSidebar): chat fills the area.
+	if p.sidebarHidden() {
 		return sidebarLayout{
 			mode:       sidebarCollapsedNarrow,
 			innerWidth: innerWidth,
@@ -258,61 +262,6 @@ func defaultKeyMap() KeyMap {
 	}
 }
 
-// getEditorDisplayNameFromEnv returns a friendly display name for the configured editor.
-// It takes visual and editorEnv values as parameters and maps common editors to display names.
-// If neither is set, it returns the platform-specific fallback that will actually be used.
-func getEditorDisplayNameFromEnv(visual, editorEnv string) string {
-	editorCmd := cmp.Or(visual, editorEnv)
-	if editorCmd == "" {
-		if goruntime.GOOS == "windows" {
-			return "Notepad"
-		}
-		return "Vi"
-	}
-
-	parts := strings.Fields(editorCmd)
-	if len(parts) == 0 {
-		return "$EDITOR"
-	}
-
-	baseName := filepath.Base(parts[0])
-
-	editorPrefixes := []struct {
-		prefix string
-		name   string
-	}{
-		{"code", "VSCode"},
-		{"cursor", "Cursor"},
-		{"nvim", "Neovim"},
-		{"vim", "Vim"},
-		{"vi", "Vi"},
-		{"nano", "Nano"},
-		{"emacs", "Emacs"},
-		{"subl", "Sublime Text"},
-		{"sublime", "Sublime Text"},
-		{"atom", "Atom"},
-		{"gedit", "gedit"},
-		{"kate", "Kate"},
-		{"notepad++", "Notepad++"},
-		{"notepad", "Notepad"},
-		{"textmate", "TextMate"},
-		{"mate", "TextMate"},
-		{"zed", "Zed"},
-	}
-
-	for _, e := range editorPrefixes {
-		if strings.HasPrefix(baseName, e.prefix) {
-			return e.name
-		}
-	}
-
-	if baseName != "" {
-		return strings.ToUpper(baseName[:1]) + baseName[1:]
-	}
-
-	return "$EDITOR"
-}
-
 // New creates a new chat page
 func New(a *app.App, sessionState *service.SessionState, opts ...PageOption) Page {
 	p := &chatPage{
@@ -338,6 +287,15 @@ type PageOption func(*chatPage)
 func WithLeanMode() PageOption {
 	return func(p *chatPage) {
 		p.leanMode = true
+	}
+}
+
+// WithHideSidebar hides the sidebar without enabling lean mode.
+// The sidebar cannot be re-shown via the TUI.
+func WithHideSidebar() PageOption {
+	return func(p *chatPage) {
+		p.hideSidebar = true
+		p.keyMap.ToggleSidebar.SetEnabled(false)
 	}
 }
 
@@ -554,12 +512,19 @@ func (p *chatPage) View() string {
 		bodyContent = lipgloss.JoinHorizontal(lipgloss.Left, chatView, toggleCol, sidebarView)
 
 	case sidebarCollapsed, sidebarCollapsedNarrow:
-		if p.leanMode {
+		switch {
+		case p.leanMode:
 			// Lean mode: no sidebar header, no fixed height
 			bodyContent = styles.ChatStyle.
 				Width(sl.innerWidth).
 				Render(messagesView)
-		} else {
+		case p.hideSidebar:
+			// Sidebar hidden: chat fills the full height, no sidebar header.
+			bodyContent = styles.ChatStyle.
+				Height(sl.chatHeight).
+				Width(sl.innerWidth).
+				Render(messagesView)
+		default:
 			sidebarRendered := p.renderCollapsedSidebar(sl)
 			chatView := styles.ChatStyle.
 				Height(sl.chatHeight).
@@ -918,6 +883,11 @@ func (p *chatPage) processMessage(msg msgtypes.SendMsg) tea.Cmd {
 	// Run command resolution and agent execution in a goroutine
 	// so the UI stays responsive while skill/agent commands are resolved.
 	go func() {
+		if skillName, task, ok := p.app.SkillCommandFork(ctx, msg.Content); ok {
+			// Fork-mode skill: run in an isolated sub-session.
+			p.app.RunSkillFork(ctx, p.msgCancel, skillName, task, msg.Attachments)
+			return
+		}
 		p.app.Run(ctx, p.msgCancel, p.app.ResolveInput(ctx, msg.Content), msg.Attachments)
 	}()
 

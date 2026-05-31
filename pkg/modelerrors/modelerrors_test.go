@@ -61,6 +61,8 @@ func TestIsRetryableModelError(t *testing.T) {
 		{name: "context overflow - thinking budget", err: errors.New("max_tokens must be greater than thinking.budget_tokens"), expected: false},
 		{name: "context overflow - wrapped", err: &ContextOverflowError{Underlying: errors.New("test")}, expected: false},
 		{name: "unknown error", err: errors.New("something weird happened"), expected: false},
+		// Vertex AI / Gemini transient 400 (issue #2683)
+		{name: "vertex function response parts 400", err: errors.New("400 Bad Request: please ensure that the number of function response parts is equal to the number of function call parts"), expected: true},
 	}
 
 	for _, tt := range tests {
@@ -157,6 +159,237 @@ func TestIsContextOverflowError(t *testing.T) {
 	}
 }
 
+func TestClassifyOverflow(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want OverflowKind
+	}{
+		// ── Tier 1: structured ──
+		{
+			name: "anthropic 413 with request_too_large body",
+			err: &StatusError{StatusCode: 413, Err: errors.New(
+				`POST "https://api.anthropic.com/v1/messages": 413 Payload Too Large {"type":"error","error":{"type":"request_too_large","message":"Request exceeds 32MB limit"}}`)},
+			want: OverflowKindWire,
+		},
+		{
+			name: "openai context_length_exceeded structured code",
+			err: errors.New(
+				`POST "https://api.openai.com/v1/chat/completions": 400 Bad Request {"error":{"message":"maximum context length is 128000 tokens","type":"invalid_request_error","code":"context_length_exceeded"}}`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "bare 413 with empty body still classifies as wire",
+			err:  &StatusError{StatusCode: 413, Err: errors.New(`413 Payload Too Large`)},
+			want: OverflowKindWire,
+		},
+		{
+			name: "vertex 413 with prompt-too-long body — wire wins via 413",
+			err: &StatusError{StatusCode: 413, Err: errors.New(
+				`413 Payload Too Large {"error":{"message":"Prompt is too long"}}`)},
+			want: OverflowKindWire,
+		},
+
+		// ── Tier 2: prose patterns by provider ──
+		{
+			name: "anthropic 400 prompt too long",
+			err: errors.New(
+				`POST "https://api.anthropic.com/v1/messages": 400 Bad Request {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 137500 tokens > 135000 maximum"}}`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "gemini input token count exceeds maximum",
+			err: errors.New(
+				`googleapi: Error 400: input token count 200000 exceeds the maximum of 128000`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "bedrock input is too long",
+			err:  errors.New(`ValidationException: input is too long for requested model`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "groq reduce the length",
+			err:  errors.New(`please reduce the length of the messages or completion`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "mistral via prose",
+			err:  errors.New(`prompt is too long for model with 32768 maximum context length`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "openai responses API",
+			err:  errors.New(`This conversation exceeds the context window for this model`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "ollama prose",
+			err:  errors.New(`prompt too long; exceeded max context length`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "z.ai non-standard finish reason as error text",
+			err:  errors.New(`finish_reason: model_context_window_exceeded`),
+			want: OverflowKindTokens,
+		},
+		{
+			name: "anthropic thinking-budget cascade (proxy for overflow)",
+			err:  errors.New(`max_tokens must be greater than thinking.budget_tokens`),
+			want: OverflowKindTokens,
+		},
+
+		// ── Tier 2: wire patterns ──
+		{
+			name: "anthropic prose request too large",
+			err:  errors.New(`request too large`),
+			want: OverflowKindWire,
+		},
+
+		// ── Tier 2: media patterns ──
+		{
+			name: "anthropic image exceeds size",
+			err: errors.New(
+				`400 Bad Request {"error":{"message":"image exceeds 5 MB maximum: 5316852 bytes > 5242880 bytes"}}`),
+			want: OverflowKindMedia,
+		},
+		{
+			name: "anthropic many-image dimensions",
+			err:  errors.New(`image dimensions exceed many-image request limit (2000px)`),
+			want: OverflowKindMedia,
+		},
+		{
+			name: "anthropic PDF pages limit",
+			err:  errors.New(`request must have a maximum of 100 PDF pages`),
+			want: OverflowKindMedia,
+		},
+
+		// ── Non-overflow errors ──
+		{
+			name: "rate limit is not overflow",
+			err:  &StatusError{StatusCode: 429, Err: errors.New(`rate_limit_error`)},
+			want: "",
+		},
+		{
+			name: "500 server error is not overflow",
+			err:  &StatusError{StatusCode: 500, Err: errors.New(`internal server error`)},
+			want: "",
+		},
+		{
+			name: "auth error is not overflow",
+			err:  errors.New(`401 unauthorized: invalid api key`),
+			want: "",
+		},
+		{
+			name: "nil",
+			err:  nil,
+			want: "",
+		},
+
+		// ── Wrapped errors ──
+		{
+			name: "already wrapped with Kind preserves Kind",
+			err:  &ContextOverflowError{Underlying: errors.New("anything"), Kind: OverflowKindWire},
+			want: OverflowKindWire,
+		},
+		{
+			name: "errors.As reaches wrapped Kind",
+			err: fmt.Errorf("all models failed: %w",
+				&ContextOverflowError{Underlying: errors.New("anything"), Kind: OverflowKindMedia}),
+			want: OverflowKindMedia,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := classifyOverflow(tt.err)
+			assert.Equal(t, tt.want, got, "classifyOverflow(%v)", tt.err)
+		})
+	}
+}
+
+func TestOverflowKindOf(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns stored Kind on wrapped error", func(t *testing.T) {
+		t.Parallel()
+		err := &ContextOverflowError{Underlying: errors.New("anything"), Kind: OverflowKindWire}
+		assert.Equal(t, OverflowKindWire, OverflowKindOf(err))
+	})
+
+	t.Run("classifies underlying when wrap has no Kind", func(t *testing.T) {
+		t.Parallel()
+		// Legacy wrap: Kind left empty, Underlying carries the signal.
+		err := &ContextOverflowError{Underlying: errors.New("prompt is too long")}
+		assert.Equal(t, OverflowKindTokens, OverflowKindOf(err))
+	})
+
+	t.Run("falls back to tokens on legacy wrap with no signal", func(t *testing.T) {
+		t.Parallel()
+		err := &ContextOverflowError{Underlying: errors.New("opaque")}
+		assert.Equal(t, OverflowKindTokens, OverflowKindOf(err))
+	})
+
+	t.Run("returns empty on non-overflow error", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, OverflowKind(""), OverflowKindOf(errors.New("rate limited")))
+		assert.Equal(t, OverflowKind(""), OverflowKindOf(nil))
+	})
+
+	t.Run("NewContextOverflowError sets Kind from underlying", func(t *testing.T) {
+		t.Parallel()
+		// Anthropic 413 with structured body → wire
+		under := &StatusError{StatusCode: 413, Err: errors.New(
+			`413 Payload Too Large {"type":"error","error":{"type":"request_too_large","message":"too big"}}`)}
+		wrapped := NewContextOverflowError(under)
+		assert.Equal(t, OverflowKindWire, wrapped.Kind)
+
+		// Token-overflow prose → tokens
+		wrapped = NewContextOverflowError(errors.New("prompt is too long"))
+		assert.Equal(t, OverflowKindTokens, wrapped.Kind)
+
+		// Image rejection → media
+		wrapped = NewContextOverflowError(errors.New("image exceeds 5 MB maximum"))
+		assert.Equal(t, OverflowKindMedia, wrapped.Kind)
+
+		// Unclassifiable underlying → tokens (safe historical default)
+		wrapped = NewContextOverflowError(errors.New("opaque"))
+		assert.Equal(t, OverflowKindTokens, wrapped.Kind)
+	})
+}
+
+func TestFormatError_OverflowKinds(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wire overflow surfaces request-too-large message", func(t *testing.T) {
+		t.Parallel()
+		err := &StatusError{StatusCode: 413, Err: errors.New(`Payload Too Large`)}
+		msg := FormatError(err)
+		assert.Contains(t, msg, "too large")
+		assert.NotContains(t, msg, "/compact")
+		assert.NotContains(t, msg, "context window")
+	})
+
+	t.Run("media overflow surfaces image-too-large message", func(t *testing.T) {
+		t.Parallel()
+		err := errors.New(`image exceeds 5 MB maximum: 5316852 bytes > 5242880 bytes`)
+		msg := FormatError(err)
+		assert.Contains(t, msg, "image or file")
+		assert.NotContains(t, msg, "/compact")
+	})
+
+	t.Run("token overflow keeps the /compact hint", func(t *testing.T) {
+		t.Parallel()
+		err := errors.New(`prompt is too long: 200000 tokens > 128000 maximum`)
+		msg := FormatError(err)
+		assert.Contains(t, msg, "context window")
+		assert.Contains(t, msg, "/compact")
+	})
+}
+
 func TestContextOverflowError(t *testing.T) {
 	t.Parallel()
 
@@ -209,6 +442,31 @@ func TestIsRetryableModelError_ContextOverflow(t *testing.T) {
 	}
 }
 
+func TestMatchesTransientPattern(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{name: "nil error", err: nil, expected: false},
+		{name: "unrelated error", err: errors.New("connection refused"), expected: false},
+		{name: "exact lowercase match", err: errors.New("number of function response parts"), expected: true},
+		// Defence-in-depth: the message is lowercased before comparison so
+		// mixed-case provider errors still match the lowercase pattern.
+		{name: "mixed-case message", err: errors.New("Please ensure that the Number Of Function Response Parts is equal"), expected: true},
+		{name: "wrapped error", err: fmt.Errorf("error receiving from stream: %w", errors.New("NUMBER OF FUNCTION RESPONSE PARTS")), expected: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, matchesTransientPattern(tt.err), "matchesTransientPattern(%v)", tt.err)
+		})
+	}
+}
+
 func TestFormatError(t *testing.T) {
 	t.Parallel()
 
@@ -238,6 +496,103 @@ func TestFormatError(t *testing.T) {
 		t.Parallel()
 		err := errors.New("authentication failed")
 		assert.Equal(t, "authentication failed", FormatError(err))
+	})
+
+	t.Run("context overflow takes precedence over status formatting", func(t *testing.T) {
+		t.Parallel()
+		underlying := errors.New("prompt is too long: 226360 tokens > 200000 maximum")
+		wrapped := NewContextOverflowError(&StatusError{StatusCode: 400, Err: underlying})
+		msg := FormatError(wrapped)
+		assert.Contains(t, msg, "context window")
+		assert.Contains(t, msg, "/compact")
+	})
+}
+
+func TestStatusErrorParsesProviderBody(t *testing.T) {
+	t.Parallel()
+
+	t.Run("opaque proxy body strips URL noise but keeps the message", func(t *testing.T) {
+		t.Parallel()
+		// This is the case the user reported: the Docker AI gateway returns
+		// only {"message":"Bad Request"}, no structured details.
+		inner := errors.New(`POST "https://ai-backend-service-stage.docker.com/proxy/v1/messages?beta=true": 400 Bad Request {"message":"Bad Request"}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, "HTTP 400: Bad Request", se.Error())
+	})
+
+	t.Run("anthropic-style body surfaces error.type and error.message", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "https://api.anthropic.com/v1/messages": 400 Bad Request {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 226360 tokens > 200000 maximum"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t,
+			"HTTP 400: invalid_request_error: prompt is too long: 226360 tokens > 200000 maximum",
+			se.Error())
+	})
+
+	t.Run("anthropic-style body keeps the request id", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "https://api.anthropic.com/v1/messages": 400 Bad Request (Request-ID: req_abc123) {"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: Field required"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t,
+			"HTTP 400: invalid_request_error: max_tokens: Field required (Request-ID: req_abc123)",
+			se.Error())
+	})
+
+	t.Run("openai-style body surfaces type, message, code and param", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "https://api.openai.com/v1/chat/completions": 400 Bad Request {"error":{"message":"Invalid model 'foo-bar'","type":"invalid_request_error","param":"model","code":"model_not_found"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t,
+			"HTTP 400: invalid_request_error: Invalid model 'foo-bar' (code=model_not_found, param=model)",
+			se.Error())
+	})
+
+	t.Run("gemini-style body surfaces numeric code and status", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`{"error":{"code":400,"message":"Invalid value at 'contents[0].parts[0]'","status":"INVALID_ARGUMENT"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t,
+			"HTTP 400: Invalid value at 'contents[0].parts[0]' (code=400, status=INVALID_ARGUMENT)",
+			se.Error())
+	})
+
+	t.Run("openai-style body with null param omits param meta", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/chat": 401 Unauthorized {"error":{"message":"Incorrect API key provided","type":"invalid_request_error","param":null,"code":"invalid_api_key"}}`)
+		se := &StatusError{StatusCode: 401, Err: inner}
+		assert.Equal(t,
+			"HTTP 401: invalid_request_error: Incorrect API key provided (code=invalid_api_key)",
+			se.Error())
+	})
+
+	t.Run("falls back to underlying message when no JSON body", func(t *testing.T) {
+		t.Parallel()
+		// No JSON, no URL — keep the existing simple format.
+		se := &StatusError{StatusCode: 429, Err: errors.New("rate limit exceeded")}
+		assert.Equal(t, "HTTP 429: rate limit exceeded", se.Error())
+	})
+
+	t.Run("falls back to underlying message when JSON has no useful fields", func(t *testing.T) {
+		t.Parallel()
+		se := &StatusError{StatusCode: 500, Err: errors.New(`POST "/v1/x": 500 Internal Server Error {"foo":"bar"}`)}
+		assert.Equal(t, `HTTP 500: POST "/v1/x": 500 Internal Server Error {"foo":"bar"}`, se.Error())
+	})
+
+	t.Run("handles braces inside string values", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request {"error":{"type":"invalid_request_error","message":"unexpected token '}' in payload"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t,
+			"HTTP 400: invalid_request_error: unexpected token '}' in payload",
+			se.Error())
+	})
+
+	t.Run("context overflow detection still works on cleaned message", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/messages": 400 Bad Request {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 226360 tokens > 200000 maximum"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.True(t, IsContextOverflowError(se),
+			"context-overflow phrasing must remain detectable in StatusError.Error()")
 	})
 }
 
@@ -401,6 +756,10 @@ func TestClassifyModelError(t *testing.T) {
 		{name: "403 StatusError", err: &StatusError{StatusCode: 403, Err: errors.New("forbidden")}, wantRetryable: false, wantRateLimited: false},
 		// Non-retryable fallback
 		{name: "401 message fallback", err: errors.New("401 unauthorized"), wantRetryable: false, wantRateLimited: false},
+		// 400 with Vertex AI "function response parts" message is treated as transient (issue #2683)
+		{name: "vertex transient 400 StatusError", err: &StatusError{StatusCode: 400, Err: errors.New("Error 400, Message: Please ensure that the number of function response parts is equal to the number of function call parts of the function call turn., Status: INVALID_ARGUMENT, Details: []")}, wantRetryable: true, wantRateLimited: false},
+		{name: "vertex transient 400 wrapped in stream error", err: fmt.Errorf("error receiving from stream: %w", &StatusError{StatusCode: 400, Err: errors.New("number of function response parts")}), wantRetryable: true, wantRateLimited: false},
+		{name: "vertex transient 400 message fallback (no StatusError)", err: errors.New("400 Bad Request: Please ensure that the number of function response parts is equal to the number of function call parts"), wantRetryable: true, wantRateLimited: false},
 		// Network errors
 		{name: "network timeout", err: &mockTimeoutError{}, wantRetryable: true, wantRateLimited: false},
 	}
@@ -435,4 +794,95 @@ func TestClassifyModelError(t *testing.T) {
 		assert.False(t, rateLimited)
 		assert.Equal(t, time.Duration(0), retryAfter)
 	})
+}
+
+func TestStatusErrorEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	t.Run("empty JSON object falls back to underlying", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request {}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, `HTTP 400: POST "/v1/x": 400 Bad Request {}`, se.Error())
+	})
+
+	t.Run("malformed JSON falls back to underlying", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request {"error":{"message":"test"`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, `HTTP 400: POST "/v1/x": 400 Bad Request {"error":{"message":"test"`, se.Error())
+	})
+
+	t.Run("multiple JSON objects extracts first", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request {"message":"First"} {"message":"Second"}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, "HTTP 400: First", se.Error())
+	})
+
+	t.Run("unicode in error message", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request {"message":"Invalid emoji: 😀"}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, "HTTP 400: Invalid emoji: 😀", se.Error())
+	})
+
+	t.Run("very large number in code field", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`{"error":{"code":9007199254740992,"message":"test"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		// Large float64 that exceeds int64 range should still format
+		assert.Contains(t, se.Error(), "test")
+		assert.Contains(t, se.Error(), "code=")
+	})
+
+	t.Run("request-id with special characters", func(t *testing.T) {
+		t.Parallel()
+		inner := errors.New(`POST "/v1/x": 400 Bad Request (Request-ID: req_abc-123_XYZ) {"message":"test"}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, "HTTP 400: test (Request-ID: req_abc-123_XYZ)", se.Error())
+	})
+
+	t.Run("brace in URL before JSON", func(t *testing.T) {
+		t.Parallel()
+		// Ensure we don't mistake a '{' in the URL for the start of JSON
+		inner := errors.New(`POST "https://api.example.com/v1/messages?param={value}": 400 Bad Request {"message":"test"}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Equal(t, "HTTP 400: test", se.Error())
+	})
+
+	t.Run("nested JSON in message field", func(t *testing.T) {
+		t.Parallel()
+		// The message field itself contains JSON-like text
+		inner := errors.New(`{"error":{"message":"Expected format: {\"key\":\"value\"}"}}`)
+		se := &StatusError{StatusCode: 400, Err: inner}
+		assert.Contains(t, se.Error(), `Expected format: {"key":"value"}`)
+	})
+}
+
+func TestScalarStringEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		input    any
+		expected string
+	}{
+		{name: "nil", input: nil, expected: ""},
+		{name: "empty string", input: "", expected: ""},
+		{name: "normal string", input: "test", expected: "test"},
+		{name: "whole number", input: float64(400), expected: "400"},
+		{name: "decimal number", input: float64(3.14), expected: "3.14"},
+		{name: "negative whole", input: float64(-500), expected: "-500"},
+		{name: "zero", input: float64(0), expected: "0"},
+		{name: "bool true", input: true, expected: "true"},
+		{name: "bool false", input: false, expected: "false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.expected, scalarString(tt.input))
+		})
+	}
 }

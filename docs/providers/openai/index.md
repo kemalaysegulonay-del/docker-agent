@@ -22,7 +22,7 @@ export OPENAI_API_KEY="sk-..."
 ```yaml
 agents:
   root:
-    model: openai/gpt-4o
+    model: openai/gpt-5-mini
 ```
 
 ### Named Model
@@ -31,7 +31,7 @@ agents:
 models:
   gpt:
     provider: openai
-    model: gpt-4o
+    model: gpt-5-mini
     temperature: 0.7
     max_tokens: 4000
 ```
@@ -45,7 +45,7 @@ models:
 | `gpt-4o`      | Multimodal, balanced performance     |
 | `gpt-4o-mini` | Cheapest, fast for simple tasks      |
 
-Find more model names at [modelname.ai](https://modelname.ai/).
+Find more model names at [modelnames.ai](https://modelnames.ai/) or in the [official OpenAI docs](https://platform.openai.com/docs/models).
 
 ## Thinking Budget
 
@@ -56,11 +56,11 @@ models:
   gpt-thinking:
     provider: openai
     model: gpt-5-mini
-    thinking_budget: low # minimal | low | medium (default) | high
+    thinking_budget: low # minimal | low | medium (default) | high | xhigh | max | none | adaptive/<level>
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Custom endpoints
+<div class="callout-title">Custom endpoints
 </div>
   <p>Use <code>base_url</code> for proxies and OpenAI-compatible services. See <a href="{{ '/providers/custom/' | relative_url }}">Custom Providers</a> for full setup.</p>
 
@@ -74,7 +74,7 @@ Use `base_url` to connect to OpenAI-compatible APIs:
 models:
   custom:
     provider: openai
-    model: gpt-4o
+    model: gpt-5-mini
     base_url: https://your-proxy.example.com/v1
 ```
 
@@ -101,9 +101,9 @@ models:
 ### Requirements
 
 - Only works with Responses API models: `gpt-4.1+`, `o1`, `o3`, `o4`, `gpt-5`
-- NOT compatible with `--gateway` flag (automatically falls back to SSE)
+- NOT compatible with the `--models-gateway` flag (automatically falls back to SSE when a gateway is configured)
 - Requires `OPENAI_API_KEY` environment variable
 
 ### Example
 
-See [`examples/websocket_transport.yaml`]({{ '/examples/websocket_transport/' | relative_url }}) for a complete example.
+See [`examples/websocket_transport.yaml`](https://github.com/docker/docker-agent/blob/main/examples/websocket_transport.yaml) for a complete example.

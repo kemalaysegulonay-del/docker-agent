@@ -2,6 +2,7 @@ package messages
 
 import (
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -11,15 +12,16 @@ import (
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/textarea"
 	tea "charm.land/bubbletea/v2"
-	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/lrucache"
 	"github.com/docker/docker-agent/pkg/runtime"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/tools"
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 	"github.com/docker/docker-agent/pkg/tui/animation"
+	"github.com/docker/docker-agent/pkg/tui/components/markdown"
 	"github.com/docker/docker-agent/pkg/tui/components/message"
 	"github.com/docker/docker-agent/pkg/tui/components/reasoningblock"
 	"github.com/docker/docker-agent/pkg/tui/components/scrollview"
@@ -35,6 +37,11 @@ import (
 
 // ToggleHideToolResultsMsg triggers hiding/showing tool results
 type ToggleHideToolResultsMsg struct{}
+
+type toggleableView interface {
+	IsToggleLine(lineIdx int) bool
+	Toggle()
+}
 
 // Model represents a chat message list component
 type Model interface {
@@ -80,9 +87,17 @@ type Model interface {
 
 // renderedItem represents a cached rendered message with position information
 type renderedItem struct {
-	view   string // Cached rendered content
-	height int    // Height in lines
+	view   string   // Cached rendered content
+	lines  []string // Pre-split lines (avoids re-splitting on every rebuild)
+	height int      // Height in lines
 }
+
+// renderedItemsCacheSize bounds the number of message renderings cached in
+// memory. Each entry can hold large strings (e.g. big tool results), so an
+// unbounded cache grows linearly with session length and message size. When
+// the cap is exceeded, the least recently rendered entry is evicted and will
+// be re-rendered on demand.
+const renderedItemsCacheSize = 500
 
 // blockIDCounter generates unique IDs for reasoning blocks.
 var blockIDCounter atomic.Uint64
@@ -100,12 +115,15 @@ type model struct {
 	height   int
 
 	// Height tracking system fields
-	scrollOffset  int                  // Current scroll position in lines
-	bottomSlack   int                  // Extra blank lines added after content shrinks
-	renderedLines []string             // Cached rendered content as lines (avoids split/join per frame)
-	renderedItems map[int]renderedItem // Cache of rendered items with positions
-	totalHeight   int                  // Total height of all content in lines
-	renderDirty   bool                 // True when rendered content needs rebuild
+	scrollOffset      int                              // Current scroll position in lines
+	bottomSlack       int                              // Extra blank lines added after content shrinks
+	slackAnimationSub animation.Subscription           // Subscription to animation ticks while slack > 0
+	renderedLines     []string                         // Cached rendered content as lines (avoids split/join per frame)
+	renderedItems     *lrucache.LRU[int, renderedItem] // LRU cache of rendered items (bounded to renderedItemsCacheSize)
+	urlSpans          *urlSpanCache                    // Cached URL spans per rendered line
+	lineOffsets       []int                            // Prefix-sum: lineOffsets[i] = starting global line of view i
+	totalHeight       int                              // Total height of all content in lines
+	renderDirty       bool                             // True when rendered content needs rebuild
 
 	selection selectionState
 
@@ -154,7 +172,8 @@ func newModel(width, height int, sessionState *service.SessionState) *model {
 	return &model{
 		width:                width,
 		height:               height,
-		renderedItems:        make(map[int]renderedItem),
+		renderedItems:        lrucache.New[int, renderedItem](renderedItemsCacheSize),
+		urlSpans:             newURLSpanCache(),
 		sessionState:         sessionState,
 		scrollview:           sv,
 		selectedMessageIndex: -1,
@@ -235,9 +254,6 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
-	case reasoningblock.BlockMsg:
-		return m.forwardToReasoningBlock(msg.GetBlockID(), msg)
-
 	case animation.TickMsg:
 		// Invalidate render cache if there's animated content that needs redrawing.
 		// This ensures fades, spinners, etc. actually update visually on each tick.
@@ -270,6 +286,15 @@ func (m *model) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 	}
 
+	// On animation ticks, decay leftover bottom slack and keep the slack
+	// subscription in sync so empty lines don't persist after thinking text
+	// fades out. Must run after children update so reasoning blocks have
+	// applied their fade state, and before tui.go's HasActive() check so the
+	// subscription is registered when the next tick is scheduled.
+	if _, ok := msg.(animation.TickMsg); ok {
+		cmds = append(cmds, m.handleAnimationTick())
+	}
+
 	return m, tea.Batch(cmds...)
 }
 
@@ -284,11 +309,11 @@ func (m *model) handleMouseClick(msg tea.MouseClickMsg) (layout.Model, tea.Cmd) 
 
 	line, col := m.mouseToLineCol(msg.X, msg.Y)
 
-	// Check for reasoning block header toggle
 	if msgIdx, localLine := m.globalLineToMessageLine(line); msgIdx >= 0 {
-		if block, ok := m.views[msgIdx].(*reasoningblock.Model); ok {
-			if block.IsToggleLine(localLine) {
-				block.Toggle()
+		// Check for toggleable blocks (e.g. reasoning block, collapsed long messages)
+		if t, ok := m.views[msgIdx].(toggleableView); ok {
+			if t.IsToggleLine(localLine) {
+				t.Toggle()
 				m.bottomSlack = 0
 				m.invalidateItem(msgIdx)
 				return m, nil
@@ -303,10 +328,18 @@ func (m *model) handleMouseClick(msg tea.MouseClickMsg) (layout.Model, tea.Cmd) 
 			})
 		}
 
+		if content, ok := m.codeBlockAt(msgIdx, localLine, col); ok {
+			return m, copyTextToClipboard(content)
+		}
+
 		if m.isCopyLabelClick(msgIdx, localLine, col) {
 			cmd := m.copyMessageToClipboard(msgIdx)
 			return m, cmd
 		}
+	}
+
+	if url := m.urlAt(line, col); url != "" {
+		return m, core.CmdHandler(messages.OpenURLMsg{URL: url})
 	}
 
 	clickCount := m.selection.detectClickType(line, col)
@@ -333,24 +366,26 @@ func (m *model) handleMouseClick(msg tea.MouseClickMsg) (layout.Model, tea.Cmd) 
 func (m *model) globalLineToMessageLine(globalLine int) (msgIdx, localLine int) {
 	m.ensureAllItemsRendered()
 
-	currentLine := 0
-	for i, view := range m.views {
-		item := m.renderItem(i, view)
-		if item.height == 0 {
-			continue
-		}
-
-		endLine := currentLine + item.height
-		if globalLine >= currentLine && globalLine < endLine {
-			return i, globalLine - currentLine
-		}
-
-		currentLine = endLine
-		if m.needsSeparator(i) {
-			currentLine++ // Account for separator line
-		}
+	if len(m.lineOffsets) == 0 || globalLine < 0 || globalLine >= m.totalHeight {
+		return -1, -1
 	}
 
+	// Binary search: find the last view whose offset <= globalLine
+	i := sort.Search(len(m.lineOffsets), func(i int) bool {
+		return m.lineOffsets[i] > globalLine
+	}) - 1
+
+	if i < 0 || i >= len(m.views) {
+		return -1, -1
+	}
+
+	item := m.renderItem(i, m.views[i])
+	local := globalLine - m.lineOffsets[i]
+	if local < item.height {
+		return i, local
+	}
+
+	// globalLine falls in a separator gap between messages
 	return -1, -1
 }
 
@@ -500,10 +535,10 @@ func (m *model) handleKeyPress(msg tea.KeyPressMsg) (layout.Model, tea.Cmd) {
 	case "pgdown":
 		m.scrollPageDown()
 		return m, nil
-	case "home":
+	case "home", "g":
 		m.scrollToTop()
 		return m, nil
-	case "end":
+	case "end", "G":
 		m.scrollToBottom()
 		return m, nil
 	}
@@ -515,34 +550,16 @@ func (m *model) View() string {
 		return ""
 	}
 
-	prevTotalHeight := m.totalHeight
-	prevScrollableHeight := m.totalHeight + m.bottomSlack
-	m.ensureAllItemsRendered()
+	m.updateScrollState()
+	// Release the slack subscription once it's no longer needed. Starting it
+	// is only done from Update via handleAnimationTick, where the returned
+	// tea.Cmd can be propagated to actually schedule the next tick.
+	if m.bottomSlack == 0 {
+		m.slackAnimationSub.Stop()
+	}
 
 	if m.totalHeight == 0 {
 		return ""
-	}
-
-	if m.userHasScrolled {
-		m.bottomSlack = 0
-	} else {
-		delta := m.totalHeight - prevTotalHeight
-		if delta < 0 {
-			m.bottomSlack += -delta
-		} else if delta > 0 && m.bottomSlack > 0 {
-			consume := min(delta, m.bottomSlack)
-			m.bottomSlack -= consume
-		}
-	}
-
-	scrollableHeight := m.totalHeight + m.bottomSlack
-	maxScrollOffset := max(0, scrollableHeight-m.height)
-
-	// Auto-scroll when content grows beyond any slack.
-	if !m.userHasScrolled && scrollableHeight > prevScrollableHeight {
-		m.scrollOffset = maxScrollOffset
-	} else {
-		m.scrollOffset = max(0, min(m.scrollOffset, maxScrollOffset))
 	}
 
 	// Use cached lines directly - O(1) instead of O(totalHeight) split
@@ -579,6 +596,63 @@ func (m *model) View() string {
 	m.scrollview.SetContent(m.renderedLines, m.totalScrollableHeight())
 	m.scrollview.SetScrollOffset(m.scrollOffset)
 	return m.scrollview.ViewWithLines(visibleLines)
+}
+
+// updateScrollState recomputes rendered content, bottom slack and scroll
+// offset from the current state of the message list. Called both from View()
+// and from Update() on animation ticks so that the slack subscription is
+// registered before tui.go schedules the next tick.
+func (m *model) updateScrollState() {
+	prevTotalHeight := m.totalHeight
+	prevScrollableHeight := m.totalHeight + m.bottomSlack
+	m.ensureAllItemsRendered()
+
+	if m.userHasScrolled {
+		m.bottomSlack = 0
+	} else {
+		delta := m.totalHeight - prevTotalHeight
+		switch {
+		case delta < 0:
+			// Cap so the viewport is never mostly empty after a large
+			// shrinkage (e.g., several tool calls fading out at once).
+			m.bottomSlack = min(m.bottomSlack-delta, m.maxBottomSlack())
+		case delta > 0 && m.bottomSlack > 0:
+			m.bottomSlack = max(0, m.bottomSlack-delta)
+		}
+	}
+
+	scrollableHeight := m.totalHeight + m.bottomSlack
+	maxScrollOffset := max(0, scrollableHeight-m.height)
+
+	// Auto-scroll when content grows beyond any slack.
+	if !m.userHasScrolled && scrollableHeight > prevScrollableHeight {
+		m.scrollOffset = maxScrollOffset
+	} else {
+		m.scrollOffset = max(0, min(m.scrollOffset, maxScrollOffset))
+	}
+}
+
+// maxBottomSlack returns the maximum blank lines added after content shrinks.
+// Small enough that the viewport never feels empty, large enough to absorb a
+// typical tool fade-out (~2 lines) without a visible jump.
+func (m *model) maxBottomSlack() int {
+	return max(1, min(5, m.height/3))
+}
+
+// handleAnimationTick refreshes scroll state, decays any leftover slack by
+// one line, and keeps the slack subscription alive while slack > 0 so
+// further ticks fire even after fade animations finish. Returns the command
+// to schedule the next tick when the subscription transitions to active.
+func (m *model) handleAnimationTick() tea.Cmd {
+	m.updateScrollState()
+	if !m.userHasScrolled && m.bottomSlack > 0 {
+		m.bottomSlack--
+	}
+	if m.bottomSlack > 0 {
+		return m.slackAnimationSub.Start()
+	}
+	m.slackAnimationSub.Stop()
+	return nil
 }
 
 // SetSize sets the dimensions of the component
@@ -620,18 +694,23 @@ func (m *model) Focus() tea.Cmd {
 		// Fall back to last selectable if no assistant messages
 		m.selectedMessageIndex = m.findLastSelectableMessage()
 	}
-	// Invalidate render cache so selection highlight is shown
-	m.invalidateAllItems()
+	// Only invalidate the newly selected message
+	if m.selectedMessageIndex >= 0 {
+		m.invalidateItem(m.selectedMessageIndex)
+	}
 	m.renderDirty = true
 	return nil
 }
 
 // Blur removes focus from the component
 func (m *model) Blur() tea.Cmd {
+	oldIndex := m.selectedMessageIndex
 	m.focused = false
 	m.selectedMessageIndex = -1
-	// Invalidate render cache so selection highlight is cleared
-	m.invalidateAllItems()
+	// Only invalidate the previously selected message
+	if oldIndex >= 0 {
+		m.invalidateItem(oldIndex)
+	}
 	m.renderDirty = true
 	return nil
 }
@@ -652,7 +731,13 @@ func (m *model) FocusAt(x, y int) tea.Cmd {
 		}
 	}
 
-	m.invalidateAllItems()
+	// Only invalidate the old and new selected messages
+	if oldIndex >= 0 {
+		m.invalidateItem(oldIndex)
+	}
+	if m.selectedMessageIndex >= 0 && m.selectedMessageIndex != oldIndex {
+		m.invalidateItem(m.selectedMessageIndex)
+	}
 	m.renderDirty = true
 
 	if m.messageTypeChanged(oldIndex, m.selectedMessageIndex) {
@@ -801,7 +886,7 @@ func (m *model) isSelectableMessage(index int) bool {
 }
 
 func (m *model) findLastSelectableMessage() int {
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		if m.isSelectableMessage(i) {
 			return i
 		}
@@ -812,10 +897,7 @@ func (m *model) findLastSelectableMessage() int {
 // findLastAssistantMessage finds the last assistant or reasoning block message.
 // Used for initial focus selection to start on assistant content.
 func (m *model) findLastAssistantMessage() int {
-	for i := len(m.messages) - 1; i >= 0; i-- {
-		if i >= len(m.messages) {
-			continue
-		}
+	for i := range slices.Backward(m.messages) {
 		msg := m.messages[i]
 		if msg.Type == types.MessageTypeAssistant || msg.Type == types.MessageTypeAssistantReasoningBlock {
 			return i
@@ -849,7 +931,11 @@ func (m *model) selectPreviousMessage() tea.Cmd {
 	if prevIndex := m.findPreviousSelectableMessage(m.selectedMessageIndex); prevIndex >= 0 {
 		oldIndex := m.selectedMessageIndex
 		m.selectedMessageIndex = prevIndex
-		m.invalidateAllItems()
+		if oldIndex >= 0 {
+			m.invalidateItem(oldIndex)
+		}
+		m.invalidateItem(prevIndex)
+		m.renderDirty = true
 		m.scrollToSelectedMessage()
 		if m.messageTypeChanged(oldIndex, prevIndex) {
 			return core.CmdHandler(messages.InvalidateStatusBarMsg{})
@@ -865,7 +951,11 @@ func (m *model) selectNextMessage() tea.Cmd {
 	if nextIndex := m.findNextSelectableMessage(m.selectedMessageIndex); nextIndex >= 0 {
 		oldIndex := m.selectedMessageIndex
 		m.selectedMessageIndex = nextIndex
-		m.invalidateAllItems()
+		if oldIndex >= 0 {
+			m.invalidateItem(oldIndex)
+		}
+		m.invalidateItem(nextIndex)
+		m.renderDirty = true
 		m.scrollToSelectedMessage()
 		if m.messageTypeChanged(oldIndex, nextIndex) {
 			return core.CmdHandler(messages.InvalidateStatusBarMsg{})
@@ -889,20 +979,14 @@ func (m *model) scrollToSelectedMessage() {
 		return
 	}
 
-	// Ensure all items are rendered so totalHeight is accurate
+	// Ensure all items are rendered so lineOffsets and totalHeight are accurate
 	m.ensureAllItemsRendered()
 
-	// Calculate the line range for the selected message
-	startLine := 0
-	for i := range m.selectedMessageIndex {
-		if i < len(m.views) {
-			item := m.renderItem(i, m.views[i])
-			startLine += item.height
-			if m.needsSeparator(i) {
-				startLine++
-			}
-		}
+	if m.selectedMessageIndex >= len(m.lineOffsets) {
+		return
 	}
+
+	startLine := m.lineOffsets[m.selectedMessageIndex]
 
 	var selectedHeight int
 	if m.selectedMessageIndex < len(m.views) {
@@ -949,8 +1033,11 @@ func (m *model) renderItem(index int, view layout.Model) renderedItem {
 	// If this message is being inline edited, render the textarea instead
 	if index == m.inlineEditMsgIndex {
 		rendered := m.renderInlineEditTextarea()
-		height := lipgloss.Height(rendered)
-		return renderedItem{view: rendered, height: height}
+		var lines []string
+		if rendered != "" {
+			lines = strings.Split(strings.TrimSuffix(rendered, "\n"), "\n")
+		}
+		return renderedItem{view: rendered, lines: lines, height: len(lines)}
 	}
 
 	isSelected := m.focused && index == m.selectedMessageIndex
@@ -966,21 +1053,21 @@ func (m *model) renderItem(index int, view layout.Model) renderedItem {
 
 	shouldCache := !isSelected && !isHovered && m.shouldCacheMessage(index)
 	if shouldCache {
-		if cached, exists := m.renderedItems[index]; exists {
+		if cached, exists := m.renderedItems.Get(index); exists {
 			return cached
 		}
 	}
 
 	rendered := view.View()
-	height := lipgloss.Height(rendered)
-	if rendered == "" {
-		height = 0
+	var lines []string
+	if rendered != "" {
+		lines = strings.Split(strings.TrimSuffix(rendered, "\n"), "\n")
 	}
 
-	item := renderedItem{view: rendered, height: height}
+	item := renderedItem{view: rendered, lines: lines, height: len(lines)}
 
 	if shouldCache {
-		m.renderedItems[index] = item
+		m.renderedItems.Put(index, item)
 	}
 
 	return item
@@ -1037,7 +1124,7 @@ func (m *model) needsSeparator(index int) bool {
 	nextIsToolCall := m.messages[index+1].Type == types.MessageTypeToolCall
 
 	// Always add a separator before transfer_task, even between consecutive tool calls
-	if nextIsToolCall && m.messages[index+1].ToolCall.Function.Name == builtin.ToolNameTransferTask {
+	if nextIsToolCall && m.messages[index+1].ToolCall.Function.Name == transfertask.ToolNameTransferTask {
 		return true
 	}
 
@@ -1057,16 +1144,16 @@ func (m *model) ensureAllItemsRendered() {
 	}
 
 	var allLines []string
+	offsets := make([]int, len(m.views))
 
 	for i, view := range m.views {
+		offsets[i] = len(allLines)
 		item := m.renderItem(i, view)
-		if item.view == "" {
+		if len(item.lines) == 0 {
 			continue
 		}
 
-		viewContent := strings.TrimSuffix(item.view, "\n")
-		lines := strings.Split(viewContent, "\n")
-		allLines = append(allLines, lines...)
+		allLines = append(allLines, item.lines...)
 
 		if m.needsSeparator(i) {
 			allLines = append(allLines, "")
@@ -1075,37 +1162,41 @@ func (m *model) ensureAllItemsRendered() {
 
 	// Store lines directly - avoid join/split on every View() call
 	m.renderedLines = allLines
+	m.lineOffsets = offsets
 	m.totalHeight = len(allLines)
+	m.urlSpans.clear()
 	m.renderDirty = false
 }
 
 func (m *model) invalidateItem(index int) {
 	if m.shouldCacheMessage(index) {
-		delete(m.renderedItems, index)
+		m.renderedItems.Delete(index)
 	}
 	m.renderDirty = true
 }
 
 func (m *model) invalidateAllItems() {
-	m.renderedItems = make(map[int]renderedItem)
+	m.renderedItems.Clear()
 	m.renderedLines = nil
+	m.lineOffsets = nil
 	m.totalHeight = 0
+	m.urlSpans.clear()
 	m.renderDirty = true
 }
 
-// forwardToReasoningBlock finds the reasoning block with the given ID and forwards the message to it.
-func (m *model) forwardToReasoningBlock(blockID string, msg tea.Msg) (layout.Model, tea.Cmd) {
-	for i, tuiMsg := range m.messages {
-		if tuiMsg.Type == types.MessageTypeAssistantReasoningBlock {
-			if block, ok := m.views[i].(*reasoningblock.Model); ok && block.ID() == blockID {
-				updatedView, cmd := m.views[i].Update(msg)
-				m.views[i] = updatedView
-				m.invalidateItem(i)
-				return m, cmd
-			}
-		}
+// finalizePreviousMessageView releases per-message render state on the most
+// recent message.Model view (if any) before a new top-level entry is
+// appended. The renderCache and IncrementalRenderer are pure caches — dropping
+// them prevents long sessions from accumulating O(N) retained render state
+// for messages that are no longer streaming, while View() lazily rebuilds
+// them if the message is ever re-rendered.
+func (m *model) finalizePreviousMessageView() {
+	if len(m.views) == 0 {
+		return
 	}
-	return m, nil
+	if mv, ok := m.views[len(m.views)-1].(message.Model); ok {
+		mv.Finalize()
+	}
 }
 
 // Message management methods
@@ -1118,11 +1209,11 @@ func (m *model) AddLoadingMessage(description string) tea.Cmd {
 }
 
 func (m *model) ReplaceLoadingWithUser(content string, sessionPos int) tea.Cmd {
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		if m.messages[i].Type == types.MessageTypeLoading {
-			m.messages = append(m.messages[:i], m.messages[i+1:]...)
+			m.messages = slices.Delete(m.messages, i, i+1)
 			if i < len(m.views) {
-				m.views = append(m.views[:i], m.views[i+1:]...)
+				m.views = slices.Delete(m.views, i, i+1)
 			}
 			m.invalidateAllItems()
 			break
@@ -1150,6 +1241,7 @@ func (m *model) AddAssistantMessage() tea.Cmd {
 }
 
 func (m *model) AddCancelledMessage() tea.Cmd {
+	m.finalizePreviousMessageView()
 	msg := types.Cancelled()
 	m.messages = append(m.messages, msg)
 	view := m.createMessageView(msg)
@@ -1174,6 +1266,7 @@ func (m *model) addMessage(msg *types.Message) tea.Cmd {
 	m.clearSelection()
 	shouldAutoScroll := !m.userHasScrolled
 
+	m.finalizePreviousMessageView()
 	m.messages = append(m.messages, msg)
 	view := m.createMessageView(msg)
 	m.sessionState.SetPreviousMessage(msg)
@@ -1240,7 +1333,7 @@ func (m *model) LoadFromSession(sess *session.Session) tea.Cmd {
 
 	m.messages = nil
 	m.views = nil
-	m.renderedItems = make(map[int]renderedItem)
+	m.renderedItems.Clear()
 	m.renderedLines = nil
 	m.scrollOffset = 0
 	m.totalHeight = 0
@@ -1334,13 +1427,23 @@ func (m *model) LoadFromSession(sess *session.Session) tea.Cmd {
 		cmds = append(cmds, view.Init())
 	}
 
+	// Finalize all but the last message.Model view: historical assistant
+	// messages will only ever be re-rendered on demand, so there is no need
+	// to keep their renderCache or IncrementalRenderer state resident. The
+	// most recent view is left untouched in case streaming continues into it.
+	for i := range len(m.views) - 1 {
+		if mv, ok := m.views[i].(message.Model); ok {
+			mv.Finalize()
+		}
+	}
+
 	cmds = append(cmds, m.ScrollToBottom())
 	return tea.Batch(cmds...)
 }
 
 func (m *model) AddOrUpdateToolCall(agentName string, toolCall tools.ToolCall, toolDef tools.Tool, status types.ToolStatus) tea.Cmd {
 	// First check if this tool call exists in any reasoning block
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		if m.messages[i].Type == types.MessageTypeAssistantReasoningBlock {
 			if block, ok := m.views[i].(*reasoningblock.Model); ok {
 				if block.HasToolCall(toolCall.ID) {
@@ -1353,7 +1456,7 @@ func (m *model) AddOrUpdateToolCall(agentName string, toolCall tools.ToolCall, t
 	}
 
 	// Then try to update existing standalone tool by ID
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		msg := m.messages[i]
 		if msg.Type == types.MessageTypeToolCall && msg.ToolCall.ID == toolCall.ID {
 			msg.ToolStatus = status
@@ -1384,6 +1487,7 @@ func (m *model) AddOrUpdateToolCall(agentName string, toolCall tools.ToolCall, t
 	}
 
 	// Otherwise create a standalone tool call message
+	m.finalizePreviousMessageView()
 	msg := types.ToolCallMessage(agentName, toolCall, toolDef, status)
 	m.messages = append(m.messages, msg)
 	view := m.createToolCallView(msg)
@@ -1395,11 +1499,11 @@ func (m *model) AddOrUpdateToolCall(agentName string, toolCall tools.ToolCall, t
 
 func (m *model) AddToolResult(msg *runtime.ToolCallResponseEvent, status types.ToolStatus) tea.Cmd {
 	// First check reasoning blocks for the tool call
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		if m.messages[i].Type == types.MessageTypeAssistantReasoningBlock {
 			if block, ok := m.views[i].(*reasoningblock.Model); ok {
 				if block.HasToolCall(msg.ToolCallID) {
-					cmd := block.UpdateToolResult(msg.ToolCallID, msg.Response, status, msg.Result)
+					cmd := block.UpdateToolResult(msg.ToolCallID, msg.Response, status, msg.Result.WithoutPayload())
 					m.invalidateItem(i)
 					return cmd
 				}
@@ -1408,12 +1512,12 @@ func (m *model) AddToolResult(msg *runtime.ToolCallResponseEvent, status types.T
 	}
 
 	// Then check standalone tool call messages
-	for i := len(m.messages) - 1; i >= 0; i-- {
+	for i := range slices.Backward(m.messages) {
 		toolMessage := m.messages[i]
 		if toolMessage.Type == types.MessageTypeToolCall && toolMessage.ToolCall.ID == msg.ToolCallID {
 			toolMessage.Content = strings.ReplaceAll(msg.Response, "\t", "    ")
 			toolMessage.ToolStatus = status
-			toolMessage.ToolResult = msg.Result
+			toolMessage.ToolResult = msg.Result.WithoutPayload()
 			m.invalidateItem(i)
 
 			view := m.createToolCallView(toolMessage)
@@ -1470,6 +1574,14 @@ func (m *model) AppendReasoning(agentName, content string) tea.Cmd {
 }
 
 // addReasoningBlock creates a new reasoning block message.
+//
+// Reasoning blocks routinely interleave with an actively streaming assistant
+// turn (the LLM emits a thought, then resumes content). Finalizing the
+// previous view here would drop the renderCache and IncrementalRenderer of
+// a message the user is still watching, and the very next chunk would have
+// to rebuild them from scratch via the transient renderer path. The next
+// non-reasoning entry (user message, tool call, error) will finalize via
+// addMessage when the streaming turn actually ends.
 func (m *model) addReasoningBlock(agentName, content string) tea.Cmd {
 	m.clearSelection()
 	shouldAutoScroll := !m.userHasScrolled
@@ -1535,7 +1647,7 @@ func (m *model) AdjustBottomSlack(delta int) {
 	if delta == 0 {
 		return
 	}
-	m.bottomSlack = max(0, m.bottomSlack+delta)
+	m.bottomSlack = max(0, min(m.bottomSlack+delta, m.maxBottomSlack()))
 }
 
 // contentWidth returns the width available for content.
@@ -1594,7 +1706,20 @@ func (m *model) removeSpinner() {
 			m.views = m.views[:lastIdx]
 		}
 		m.messages = m.messages[:lastIdx]
-		m.invalidateAllItems()
+		// The spinner is always at the tail, so other indices are unchanged
+		// and their cached entries remain valid. Only the joined renderedLines
+		// references the now-removed spinner, so we drop it and force a rejoin
+		// on the next render. The LRU itself never held a spinner entry
+		// (shouldCacheMessage returns false for spinner-driven types).
+		// Avoiding invalidateAllItems here is essential for long sessions:
+		// it would otherwise wipe up to 500 cached renderings once per
+		// assistant turn, forcing every previous message to be re-parsed
+		// from markdown on the next render.
+		m.renderedLines = nil
+		m.lineOffsets = nil
+		m.totalHeight = 0
+		m.urlSpans.clear()
+		m.renderDirty = true
 	}
 }
 
@@ -1655,12 +1780,11 @@ func (m *model) isEditLabelClick(msgIdx, localLine, col int) (bool, *types.Messa
 	}
 
 	item := m.renderItem(msgIdx, m.views[msgIdx])
-	lines := strings.Split(item.view, "\n")
-	if localLine < 0 || localLine >= len(lines) {
+	if localLine < 0 || localLine >= len(item.lines) {
 		return false, nil
 	}
 
-	plainLine := ansi.Strip(lines[localLine])
+	plainLine := ansi.Strip(item.lines[localLine])
 	before, _, ok := strings.Cut(plainLine, types.UserMessageEditLabel)
 	if !ok {
 		return false, nil
@@ -1673,6 +1797,51 @@ func (m *model) isEditLabelClick(msgIdx, localLine, col int) (bool, *types.Messa
 	}
 
 	return false, nil
+}
+
+// codeBlockAt returns the raw code of the fenced code block whose copy label
+// is at the given click position, if any.
+func (m *model) codeBlockAt(msgIdx, localLine, col int) (string, bool) {
+	if msgIdx < 0 || msgIdx >= len(m.messages) {
+		return "", false
+	}
+	if msgIdx >= len(m.views) {
+		return "", false
+	}
+	mv, ok := m.views[msgIdx].(message.Model)
+	if !ok {
+		return "", false
+	}
+	blocks := mv.CodeBlocks()
+	if len(blocks) == 0 {
+		return "", false
+	}
+	var target *markdown.CodeBlock
+	for i := range blocks {
+		if blocks[i].Line == localLine {
+			target = &blocks[i]
+			break
+		}
+	}
+	if target == nil {
+		return "", false
+	}
+
+	item := m.renderItem(msgIdx, m.views[msgIdx])
+	if localLine < 0 || localLine >= len(item.lines) {
+		return "", false
+	}
+	plainLine := ansi.Strip(item.lines[localLine])
+	before, _, found := strings.Cut(plainLine, markdown.CodeBlockCopyIcon)
+	if !found {
+		return "", false
+	}
+	iconStart := ansi.StringWidth(before)
+	iconEnd := iconStart + ansi.StringWidth(markdown.CodeBlockCopyIcon)
+	if col < iconStart || col >= iconEnd {
+		return "", false
+	}
+	return target.Content, true
 }
 
 // isCopyLabelClick checks if the click is on the copy label of an assistant message.
@@ -1693,12 +1862,11 @@ func (m *model) isCopyLabelClick(msgIdx, localLine, col int) bool {
 	}
 
 	item := m.renderItem(msgIdx, m.views[msgIdx])
-	lines := strings.Split(item.view, "\n")
-	if localLine < 0 || localLine >= len(lines) {
+	if localLine < 0 || localLine >= len(item.lines) {
 		return false
 	}
 
-	plainLine := ansi.Strip(lines[localLine])
+	plainLine := ansi.Strip(item.lines[localLine])
 	before, _, ok := strings.Cut(plainLine, types.AssistantMessageCopyLabel)
 	if !ok {
 		return false

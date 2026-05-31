@@ -11,11 +11,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/goccy/go-yaml"
-	"github.com/natefinch/atomic"
 
+	"github.com/docker/docker-agent/pkg/atomicfile"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/paths"
 )
@@ -30,17 +31,22 @@ type Alias struct {
 	Model string `yaml:"model,omitempty"`
 	// HideToolResults hides tool call results in the TUI
 	HideToolResults bool `yaml:"hide_tool_results,omitempty"`
+	// Sandbox runs the agent inside a Docker sandbox by default.
+	Sandbox bool `yaml:"sandbox,omitempty"`
 }
 
 // HasOptions returns true if the alias has any runtime options set
 func (a *Alias) HasOptions() bool {
-	return a != nil && (a.Yolo || a.Model != "" || a.HideToolResults)
+	return a != nil && (a.Yolo || a.Model != "" || a.HideToolResults || a.Sandbox)
 }
 
 // Settings represents global user settings
 type Settings struct {
 	// HideToolResults hides tool call results in the TUI by default
 	HideToolResults bool `yaml:"hide_tool_results,omitempty"`
+	// ExpandThinking expands reasoning/tool blocks in the TUI by default.
+	// Defaults to false when not set.
+	ExpandThinking *bool `yaml:"expand_thinking,omitempty"`
 	// SplitDiffView enables side-by-side split diff rendering for file edits.
 	// Defaults to true when not set.
 	SplitDiffView *bool `yaml:"split_diff_view,omitempty"`
@@ -61,6 +67,8 @@ type Settings struct {
 	// SoundThreshold is the minimum duration in seconds a task must run
 	// before a success sound is played. Defaults to 5 seconds.
 	SoundThreshold int `yaml:"sound_threshold,omitempty"`
+	// Snapshot enables automatic shadow-git snapshots globally when true.
+	Snapshot *bool `yaml:"snapshot,omitempty"`
 	// Permissions defines global permission patterns applied across all sessions
 	// and agents. These act as user-wide defaults; session-level and agent-level
 	// permissions override them.
@@ -97,12 +105,25 @@ func (s *Settings) GetSoundThreshold() int {
 	return s.SoundThreshold
 }
 
+// GetExpandThinking returns whether reasoning/tool blocks are expanded by default.
+func (s *Settings) GetExpandThinking() bool {
+	if s == nil || s.ExpandThinking == nil {
+		return false
+	}
+	return *s.ExpandThinking
+}
+
 // GetSplitDiffView returns whether split diff view is enabled, defaulting to true.
 func (s *Settings) GetSplitDiffView() bool {
 	if s == nil || s.SplitDiffView == nil {
 		return true
 	}
 	return *s.SplitDiffView
+}
+
+// SnapshotsEnabled returns whether global snapshot auto-injection is enabled.
+func (s *Settings) SnapshotsEnabled() bool {
+	return s != nil && s.Snapshot != nil && *s.Snapshot
 }
 
 // CredentialHelper contains configuration for a credential helper command
@@ -136,6 +157,14 @@ type Config struct {
 	Settings *Settings `yaml:"settings,omitempty"`
 	// CredentialHelper configures an external command to retrieve Docker credentials
 	CredentialHelper *CredentialHelper `yaml:"credential_helper,omitempty"`
+	// SandboxAllowlist is the persistent list of hosts the user has
+	// taught docker-agent to open in the sandbox proxy on every run
+	// (in addition to the gateway, the kit-resolved tool install
+	// hosts, and the agent-declared runtime.network_allowlist).
+	// Managed via `docker agent sandbox allow/deny/list`. Each entry
+	// is a hostname with an optional ":port" suffix; commas and
+	// whitespace are rejected at write time.
+	SandboxAllowlist []string `yaml:"sandbox_allowlist,omitempty"`
 }
 
 // Path returns the path to the config file
@@ -242,7 +271,7 @@ func (c *Config) Save() error {
 }
 
 func (c *Config) saveTo(path string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -254,7 +283,9 @@ func (c *Config) saveTo(path string) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	return atomic.WriteFile(path, bytes.NewReader(data))
+	// The config may contain a credential helper command, so restrict it
+	// to the user.
+	return atomicfile.Write(path, bytes.NewReader(data), 0o600)
 }
 
 // GetAlias retrieves the alias configuration for a given name.
@@ -347,4 +378,70 @@ func Get() *Settings {
 		return &Settings{}
 	}
 	return cfg.GetSettings()
+}
+
+// AddSandboxHosts appends host(s) to SandboxAllowlist, preserving
+// insertion order and skipping duplicates. Each entry is trimmed of
+// surrounding whitespace; commas and embedded whitespace are
+// rejected because the sandbox network policy joins entries with
+// commas downstream and a single value containing one of those
+// would silently smuggle several distinct rules into the engine.
+//
+// All entries are validated before any mutation: a malformed value
+// in the batch leaves c.SandboxAllowlist unchanged so callers that
+// reuse the *Config after a failed call still observe a consistent
+// in-memory view.
+//
+// Returns the list of hosts that were actually added (i.e. not
+// already present), so callers can report "already allowed" without
+// re-walking the slice.
+func (c *Config) AddSandboxHosts(hosts ...string) ([]string, error) {
+	cleaned := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if strings.ContainsAny(h, ", \t") {
+			return nil, fmt.Errorf("refusing to allowlist host %q: contains comma or whitespace", h)
+		}
+		cleaned = append(cleaned, h)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	existing := make(map[string]struct{}, len(c.SandboxAllowlist))
+	for _, h := range c.SandboxAllowlist {
+		existing[h] = struct{}{}
+	}
+
+	var added []string
+	for _, h := range cleaned {
+		if _, ok := existing[h]; ok {
+			continue
+		}
+		existing[h] = struct{}{}
+		c.SandboxAllowlist = append(c.SandboxAllowlist, h)
+		added = append(added, h)
+	}
+	return added, nil
+}
+
+// RemoveSandboxHost drops host from SandboxAllowlist. Returns true
+// when the host was present.
+func (c *Config) RemoveSandboxHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i, h := range c.SandboxAllowlist {
+		if h == host {
+			c.SandboxAllowlist = append(c.SandboxAllowlist[:i], c.SandboxAllowlist[i+1:]...)
+			return true
+		}
+	}
+	return false
 }

@@ -60,7 +60,8 @@ func newSemanticVectorDB(dbPath string, vectorDimensions int, strategyName strin
 }
 
 func (d *semanticVectorDB) createSchema() error {
-	schema := fmt.Sprintf(`
+	schema := fmt.Sprintf( //nolint:gosec // table names are internal, no user input
+		`
 	CREATE TABLE IF NOT EXISTS %s (
 		source_path TEXT PRIMARY KEY,
 		file_hash TEXT NOT NULL,
@@ -79,12 +80,12 @@ func (d *semanticVectorDB) createSchema() error {
 	);
 	`, d.filesTable, d.tablePrefix, d.filesTable, d.chunksTable, d.filesTable)
 
-	if _, err := d.db.Exec(schema); err != nil {
+	if _, err := d.db.ExecContext(context.Background(), schema); err != nil {
 		return err
 	}
 
 	// Migration for existing databases that don't have embedding_input column
-	_, _ = d.db.Exec(fmt.Sprintf(`ALTER TABLE %s ADD COLUMN embedding_input TEXT`, d.chunksTable))
+	_, _ = d.db.ExecContext(context.Background(), fmt.Sprintf(`ALTER TABLE %s ADD COLUMN embedding_input TEXT`, d.chunksTable))
 
 	return nil
 }
@@ -135,7 +136,8 @@ func (d *semanticVectorDB) AddDocumentWithEmbedding(ctx context.Context, doc dat
 
 // SearchSimilarVectors implements vectorStoreDB.
 func (d *semanticVectorDB) SearchSimilarVectors(ctx context.Context, queryEmbedding []float64, limit int) ([]VectorSearchResultData, error) {
-	query := fmt.Sprintf(`
+	query := fmt.Sprintf( //nolint:gosec // table names are internal, no user input
+		`
 	SELECT c.source_path, c.chunk_index, c.content, c.embedding, c.embedding_input, f.file_hash, f.indexed_at
 	FROM %s c
 	JOIN %s f ON c.source_path = f.source_path
@@ -205,7 +207,7 @@ func (d *semanticVectorDB) GetFileMetadata(ctx context.Context, sourcePath strin
 		 GROUP BY f.source_path, f.file_hash, f.indexed_at`, d.filesTable, d.chunksTable),
 		sourcePath).Scan(&metadata.SourcePath, &metadata.FileHash, &metadata.LastIndexed, &metadata.ChunkCount)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -254,8 +256,5 @@ func (d *semanticVectorDB) DeleteFileMetadata(ctx context.Context, sourcePath st
 }
 
 func (d *semanticVectorDB) Close() error {
-	if _, err := d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		slog.Warn("Failed to checkpoint WAL before close", "error", err)
-	}
-	return d.db.Close()
+	return sqliteutil.CheckpointAndClose(d.db)
 }

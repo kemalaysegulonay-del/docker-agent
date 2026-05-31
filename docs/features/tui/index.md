@@ -26,29 +26,79 @@ $ docker agent run agent.yaml --yolo
 
 # Enable debug logging
 $ docker agent run agent.yaml --debug
+
+# Override the application name shown in the status bar and window title
+$ docker agent run agent.yaml --app-name "My Project"
+
+# Hide the sidebar (cannot be re-enabled via Ctrl+B)
+$ docker agent run agent.yaml --sidebar=false
+
+# Disable specific slash commands
+$ docker agent run agent.yaml --disable-commands="/cost,/eval,/model"
 ```
 
 ## Slash Commands
 
 Type `/` during a session to see available commands, or press <kbd>Ctrl</kbd>+<kbd>K</kbd> for the command palette:
 
-| Command     | Description                                    |
-| ----------- | ---------------------------------------------- |
-| `/new`      | Start a new conversation                       |
-| `/compact`  | Summarize and compact the conversation history |
-| `/copy`     | Copy the conversation to clipboard             |
-| `/export`   | Export the session as HTML                     |
-| `/sessions` | Browse and load past sessions                  |
-| `/model`    | Change the model for the current agent         |
-| `/theme`    | Change the color theme                         |
-| `/yolo`     | Toggle automatic tool call approval            |
-| `/title`    | Set or regenerate session title                |
-| `/attach`   | Attach a file to your message                  |
-| `/shell`    | Open a shell                                   |
-| `/star`     | Star/unstar the current session                |
-| `/cost`     | Show cost breakdown for this session           |
-| `/eval`     | Create an evaluation report                    |
-| `/exit`     | Exit the application                           |
+| Command            | Description                                                                          |
+| ------------------ | ------------------------------------------------------------------------------------ |
+| `/new`             | Start a new conversation                                                             |
+| `/clear`           | Clear the current conversation (keep session, drop messages)                         |
+| `/compact`         | Summarize and compact the conversation history                                       |
+| `/fork`            | Fork the current session into a new branch                                           |
+| `/copy`            | Copy the entire conversation to clipboard                                            |
+| `/copy-last`       | Copy only the last assistant message to clipboard                                    |
+| `/undo`            | Restore file changes from the latest snapshot (only when snapshots are enabled)      |
+| `/snapshots`       | List captured snapshots (only when snapshots are enabled)                            |
+| `/export`          | Export the session as HTML                                                           |
+| `/sessions`        | Browse and load past sessions                                                        |
+| `/model`           | Change the model for the current agent                                               |
+| `/theme`           | Change the color theme                                                               |
+| `/yolo`            | Toggle automatic tool call approval                                                  |
+| `/title`           | Set or regenerate session title                                                      |
+| `/attach`          | Attach a file to your message                                                        |
+| `/shell`           | Open a shell                                                                         |
+| `/star`            | Star/unstar the current session                                                      |
+| `/cost`            | Show cost breakdown for this session                                                 |
+| `/eval`            | Create an evaluation report                                                          |
+| `/pause`           | Pause/resume the runtime loop after the current request                              |
+| `/tools`           | Show every toolset (with lifecycle state) and the tools they expose                  |
+| `/toolset-restart` | Force a supervisor-driven reconnect of the named toolset (`/toolset-restart <name>`) |
+| `/permissions`     | Inspect and edit tool permission rules                                               |
+| `/split-diff`      | Toggle split-diff view for file edits                                                |
+| `/speak`           | Voice input via system speech-to-text (macOS only)                                   |
+| `/exit`            | Exit the application (aliases: `/quit`, `/q`)                                        |
+
+### Thinking and Tool Details
+
+Reasoning/thinking blocks are collapsed by default. When collapsed, the TUI shows a short preview and compact tool summaries. Expand a block to see the full thinking content and the real tool renderers, including detailed tool output such as file edit diffs.
+
+To start new sessions with thinking/tool blocks expanded by default, set `expand_thinking` in your user config:
+
+```yaml
+# ~/.config/cagent/config.yaml
+settings:
+  expand_thinking: true
+```
+
+Set it to `false` or omit it to keep the default collapsed behavior.
+
+### Snapshots, `/undo`, and `/snapshots`
+
+Enable shadow-git snapshots globally in `~/.config/cagent/config.yaml`:
+
+```yaml
+settings:
+  snapshot: true
+```
+
+When enabled, docker-agent records filesystem snapshots at turn boundaries. The TUI exposes two slash commands that operate on those snapshots:
+
+- **`/undo`** restores files from the most recent snapshot (one step back).
+- **`/snapshots`** opens a dialog showing how many snapshots have been captured and the number of files in each one. Use <kbd>↑</kbd>/<kbd>↓</kbd> (or <kbd>j</kbd>/<kbd>k</kbd>) to highlight an entry, then press <kbd>r</kbd> to reset the workspace to that point. Pick `<original>` to revert every snapshot and bring the workspace back to its pre-agent state. <kbd>Esc</kbd> closes the dialog without changing anything.
+
+Neither command removes messages from the session transcript — they only touch files on disk. Both commands (and the matching command-palette entries) are hidden when snapshots are turned off. Omit `snapshot` or set it to `false` to leave automatic snapshots off; agents can still configure snapshot hooks manually.
 
 ## File Attachments
 
@@ -74,7 +124,7 @@ Change the AI model during a session with `/model` or <kbd>Ctrl</kbd>+<kbd>M</kb
 3. The model switch is saved with the session and restored on reload
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Use model switching to try a more capable model for complex tasks, or a cheaper one for simple queries — without modifying your YAML config.</p>
 
@@ -112,7 +162,7 @@ Customize session titles to make them more meaningful and easier to find. By def
 3. Press <kbd>Enter</kbd> to save, or <kbd>Escape</kbd> to cancel
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Note
+<div class="callout-title">Note
 </div>
   <p>Manually set titles are preserved and won’t be overwritten by auto-generation. Title changes are persisted immediately to the session.</p>
 
@@ -120,17 +170,26 @@ Customize session titles to make them more meaningful and easier to find. By def
 
 ## Keyboard Shortcuts
 
-| Shortcut | Action                                          |
-| -------- | ----------------------------------------------- |
-| Ctrl+K   | Open command palette                            |
-| Ctrl+M   | Switch model                                    |
-| Ctrl+R   | Reverse history search (search previous inputs) |
-| Ctrl+L   | Start audio listening mode (voice input)        |
-| Ctrl+Z   | Suspend TUI to background (resume with `fg`)    |
-| Ctrl+X   | Clear queued messages                           |
-| Escape   | Cancel current operation                        |
-| Enter    | Send message (or newline with Shift+Enter)      |
-| Up/Down  | Navigate message history                        |
+| Shortcut   | Action                                          |
+| ---------- | ----------------------------------------------- |
+| Ctrl+K     | Open command palette                            |
+| Ctrl+M     | Switch model                                    |
+| Ctrl+R     | Reverse history search (search previous inputs) |
+| Ctrl+G     | Cancel reverse history search                   |
+| Ctrl+S     | Cycle to next agent in the team                 |
+| Ctrl+1 – 9 | Switch directly to agent _N_ in the team list   |
+| Ctrl+T     | Open a new tab (additional agent session)       |
+| Ctrl+W     | Close the current tab                           |
+| Ctrl+N     | Next tab                                        |
+| Ctrl+P     | Previous tab                                    |
+| Ctrl+B     | Toggle the sidebar (full-UI mode only; disabled when --sidebar=false) |
+| Ctrl+Y     | Toggle YOLO mode (auto-approve tool calls)      |
+| Ctrl+O     | Toggle hide tool results                        |
+| Ctrl+Z     | Suspend TUI to background (resume with `fg`)    |
+| Ctrl+X     | Clear queued messages                           |
+| Escape     | Cancel current operation                        |
+| Enter      | Send message (or newline with Shift+Enter)      |
+| Up/Down    | Navigate message history                        |
 
 Press <kbd>Ctrl</kbd>+<kbd>H</kbd> to view the complete list of all available keyboard shortcuts.
 
@@ -202,17 +261,19 @@ settings:
   theme: my-theme # References ~/.cagent/themes/my-theme.yaml
 ```
 
+**At launch:** Pass `--theme <name>` to `docker agent run` to preselect a theme for that session. This overrides `settings.theme` in your config but is not saved. Invalid theme names print an error at startup listing the available options. Has no effect in `--exec` mode.
+
 **At runtime:** Use the `/theme` command to open the theme picker and select from available themes. Your selection is saved globally in `~/.config/cagent/config.yaml` under `settings.theme` and persists across sessions.
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Hot Reload
+<div class="callout-title">Hot Reload
 </div>
   <p>Custom themes auto-reload when you save changes to the file — no restart needed. This makes it easy to tweak colors in real-time.</p>
 
 </div>
 
 <div class="callout callout-warning" markdown="1">
-<div class="callout-title">⚠️ Partial overrides
+<div class="callout-title">Partial overrides
 </div>
   <p>All user themes are applied on top of the <code>default</code> theme. If you want to customize a built-in theme (e.g., <code>dracula</code>), copy its full YAML from the <a href="https://github.com/docker/docker-agent/tree/main/pkg/tui/styles/themes">built-in themes on GitHub</a> into <code>~/.cagent/themes/</code> and edit the copy. Otherwise, omitted values will use <code>default</code> colors, not the original theme's colors.</p>
 
@@ -229,8 +290,20 @@ When an agent calls a tool, docker-agent shows a confirmation dialog by default.
 **Granular permissions:** The permission system supports pattern-based matching. When you “Always allow” a specific tool command, only that exact pattern is auto-approved — other commands from the same tool still require confirmation. This lets you auto-approve safe, read-only operations while maintaining control over destructive ones.
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 YOLO mode
+<div class="callout-title">YOLO mode
 </div>
   <p>Use <code>--yolo</code> or the <code>/yolo</code> command to auto-approve all tool calls. You can also toggle this mid-session. For aliases, set <code>--yolo</code> when creating the alias: <code>docker agent alias add fast agentcatalog/coder --yolo</code>.</p>
 
 </div>
+
+## Notifications
+
+The TUI displays transient notification banners for agent warnings, errors, and other runtime events. Notifications auto-dismiss after a short delay unless the mouse is hovering over them — hovering pauses the timer so you have time to read the message.
+
+| Interaction | Behaviour |
+| ----------- | --------- |
+| Hover       | Pauses auto-dismiss; the notification stays visible until the mouse moves away |
+| Click       | Copies the notification text to the clipboard |
+| × (close)   | Dismisses immediately; the glyph turns red when hovered |
+
+Hint text in the top-left corner of the notification border shows the available actions at a glance.

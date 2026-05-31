@@ -22,6 +22,8 @@ import (
 	"github.com/docker/docker-agent/pkg/model/provider/base"
 	"github.com/docker/docker-agent/pkg/model/provider/options"
 	"github.com/docker/docker-agent/pkg/model/provider/providerutil"
+	"github.com/docker/docker-agent/pkg/modelinfo"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/rag/prompts"
 	"github.com/docker/docker-agent/pkg/rag/types"
 	"github.com/docker/docker-agent/pkg/tools"
@@ -121,7 +123,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	} else {
 		// Fail fast if Docker Desktop's auth token isn't available
 		if token, _ := env.Get(ctx, environment.DockerDesktopTokenEnv); token == "" {
-			slog.Error("Gemini client creation failed", "error", "failed to get Docker Desktop's authentication token")
+			slog.ErrorContext(ctx, "Gemini client creation failed", "error", "failed to get Docker Desktop's authentication token")
 			return nil, errors.New("sorry, you first need to sign in Docker Desktop to use the Docker AI Gateway")
 		}
 
@@ -130,7 +132,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 			// Query a fresh auth token each time the client is used
 			authToken, _ := env.Get(ctx, environment.DockerDesktopTokenEnv)
 			if authToken == "" {
-				return nil, errors.New("failed to get Docker Desktop token for Gateway")
+				return nil, errors.New(base.NoDesktopTokenErrorMessage)
 			}
 
 			url, err := url.Parse(gateway)
@@ -164,7 +166,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 		}
 	}
 
-	slog.Debug("Gemini client created successfully", "model", cfg.Model)
+	slog.DebugContext(ctx, "Gemini client created successfully", "model", cfg.Model)
 
 	return &Client{
 		Config: base.Config{
@@ -192,7 +194,7 @@ func thoughtSignatureOrDefault(sig []byte) []byte {
 }
 
 // convertMessagesToGemini converts chat.Messages into Gemini Contents
-func convertMessagesToGemini(messages []chat.Message) []*genai.Content {
+func convertMessagesToGemini(ctx context.Context, messages []chat.Message, id modelsdev.ID, store *modelsdev.Store) []*genai.Content {
 	contents := make([]*genai.Content, 0, len(messages))
 	for i := range messages {
 		msg := &messages[i]
@@ -257,7 +259,7 @@ func convertMessagesToGemini(messages []chat.Message) []*genai.Content {
 
 		// Handle regular messages
 		if len(msg.MultiContent) > 0 {
-			parts := convertMultiContent(msg.MultiContent, msg.ThoughtSignature)
+			parts := convertMultiContent(ctx, msg.MultiContent, msg.ThoughtSignature, id, store)
 			if len(parts) > 0 {
 				contents = append(contents, genai.NewContentFromParts(parts, role))
 			}
@@ -287,15 +289,27 @@ func newTextPartWithSignature(text string, signature []byte) *genai.Part {
 }
 
 // convertMultiContent converts multi-part content to Gemini parts
-func convertMultiContent(multiContent []chat.MessagePart, thoughtSignature []byte) []*genai.Part {
+func convertMultiContent(ctx context.Context, multiContent []chat.MessagePart, thoughtSignature []byte, id modelsdev.ID, store *modelsdev.Store) []*genai.Part {
 	parts := make([]*genai.Part, 0, len(multiContent))
 	for _, part := range multiContent {
 		switch part.Type {
 		case chat.MessagePartTypeText:
 			parts = append(parts, newTextPartWithSignature(part.Text, thoughtSignature))
 		case chat.MessagePartTypeImageURL:
+			// Note: superseded by MessagePartTypeDocument.
 			if imgPart := convertImageURLToPart(part.ImageURL); imgPart != nil {
 				parts = append(parts, imgPart)
+			}
+		case chat.MessagePartTypeDocument:
+			if part.Document != nil {
+				docPart, err := convertDocument(ctx, *part.Document, id, store)
+				if err != nil {
+					slog.WarnContext(ctx, "failed to convert document attachment", "error", err, "doc", part.Document.Name)
+					continue
+				}
+				if docPart != nil {
+					parts = append(parts, docPart)
+				}
 			}
 		}
 	}
@@ -338,7 +352,7 @@ func extractMimeType(dataURLPrefix string) string {
 func (c *Client) buildConfig() *genai.GenerateContentConfig {
 	config := &genai.GenerateContentConfig{}
 	if c.ModelConfig.MaxTokens != nil {
-		config.MaxOutputTokens = int32(*c.ModelConfig.MaxTokens)
+		config.MaxOutputTokens = int32(*c.ModelConfig.MaxTokens) //nolint:gosec // user-configured token count; realistic values fit in int32
 	}
 	if c.ModelConfig.Temperature != nil {
 		config.Temperature = new(float32(*c.ModelConfig.Temperature))
@@ -366,8 +380,7 @@ func (c *Client) buildConfig() *genai.GenerateContentConfig {
 		// that always think, use the lowest level and bump MaxOutputTokens so
 		// internal reasoning doesn't consume the entire budget. Gemini 2.5 and
 		// older can fully disable thinking with ThinkingBudget=0.
-		model := strings.ToLower(c.ModelConfig.Model)
-		if isGemini3PlusModel(model) {
+		if modelinfo.UsesThinkingLevel(c.ModelConfig.Model) {
 			config.ThinkingConfig = &genai.ThinkingConfig{
 				IncludeThoughts: false,
 				ThinkingLevel:   genai.ThinkingLevelLow,
@@ -384,7 +397,7 @@ func (c *Client) buildConfig() *genai.GenerateContentConfig {
 		}
 	} else if c.ModelConfig.ThinkingBudget != nil {
 		config.ThinkingConfig = &genai.ThinkingConfig{IncludeThoughts: true}
-		if isGemini3PlusModel(strings.ToLower(c.ModelConfig.Model)) {
+		if modelinfo.UsesThinkingLevel(c.ModelConfig.Model) {
 			c.applyGemini3ThinkingLevel(config)
 		} else {
 			c.applyGemini25ThinkingBudget(config)
@@ -438,7 +451,7 @@ func gemini3ThinkingLevel(effortStr string) (genai.ThinkingLevel, bool) {
 // applyGemini25ThinkingBudget applies token-based thinking for Gemini 2.5 and other models.
 func (c *Client) applyGemini25ThinkingBudget(config *genai.GenerateContentConfig) {
 	tokens := c.ModelConfig.ThinkingBudget.Tokens
-	config.ThinkingConfig.ThinkingBudget = new(int32(tokens))
+	config.ThinkingConfig.ThinkingBudget = new(int32(tokens)) //nolint:gosec // user-configured thinking budget fits in int32
 	slog.Debug("Gemini request using thinking_budget", "budget_tokens", tokens)
 }
 
@@ -562,7 +575,7 @@ func (c *Client) CreateChatCompletionStream(
 	if len(requestTools) > 0 {
 		allTools, err := convertToolsToGemini(requestTools)
 		if err != nil {
-			slog.Error("Failed to convert tools to Gemini format", "error", err)
+			slog.ErrorContext(ctx, "Failed to convert tools to Gemini format", "error", err)
 			return nil, err
 		}
 
@@ -581,25 +594,25 @@ func (c *Client) CreateChatCompletionStream(
 		}
 
 		// Debug: Log the tools we're sending
-		slog.Debug("Gemini tools config", "tools", config.Tools)
+		slog.DebugContext(ctx, "Gemini tools config", "tools", config.Tools)
 		for _, tool := range config.Tools {
 			for _, fn := range tool.FunctionDeclarations {
-				slog.Debug("Function", "name", fn.Name, "desc", fn.Description, "params", fn.Parameters)
+				slog.DebugContext(ctx, "Function", "name", fn.Name, "desc", fn.Description, "params", fn.Parameters)
 			}
 		}
 	}
 
-	contents := convertMessagesToGemini(messages)
+	contents := convertMessagesToGemini(ctx, messages, c.ID(), c.ModelOptions.ModelsDevStore())
 
 	// Debug: Log the messages we're sending
-	slog.Debug("Gemini messages", "count", len(contents))
+	slog.DebugContext(ctx, "Gemini messages", "count", len(contents))
 	for i, content := range contents {
-		slog.Debug("Message", "index", i, "role", content.Role)
+		slog.DebugContext(ctx, "Message", "index", i, "role", content.Role)
 	}
 
 	client, err := c.clientFn(ctx)
 	if err != nil {
-		slog.Error("Failed to create Gemini client", "error", err)
+		slog.ErrorContext(ctx, "Failed to create Gemini client", "error", err)
 		return nil, err
 	}
 
@@ -615,11 +628,11 @@ func (c *Client) Rerank(ctx context.Context, query string, documents []types.Doc
 	const logPrefix = "Gemini reranking request"
 
 	if len(documents) == 0 {
-		slog.Debug(logPrefix, "model", c.ModelConfig.Model, "num_documents", 0)
+		slog.DebugContext(ctx, logPrefix, "model", c.ModelConfig.Model, "num_documents", 0)
 		return []float64{}, nil
 	}
 
-	slog.Debug(logPrefix,
+	slog.DebugContext(ctx, logPrefix,
 		"model", c.ModelConfig.Model,
 		"query_length", len(query),
 		"num_documents", len(documents),
@@ -627,7 +640,7 @@ func (c *Client) Rerank(ctx context.Context, query string, documents []types.Doc
 
 	client, err := c.clientFn(ctx)
 	if err != nil {
-		slog.Error("Failed to create Gemini client for reranking", "error", err)
+		slog.ErrorContext(ctx, "Failed to create Gemini client for reranking", "error", err)
 		return nil, err
 	}
 
@@ -685,7 +698,7 @@ func (c *Client) Rerank(ctx context.Context, query string, documents []types.Doc
 
 	resp, err := client.Models.GenerateContent(ctx, c.ModelConfig.Model, []*genai.Content{content}, cfg)
 	if err != nil {
-		slog.Error("Gemini rerank request failed", "error", err)
+		slog.ErrorContext(ctx, "Gemini rerank request failed", "error", err)
 		return nil, fmt.Errorf("gemini rerank request failed: %w", err)
 	}
 
@@ -696,17 +709,17 @@ func (c *Client) Rerank(ctx context.Context, query string, documents []types.Doc
 
 	rawJSON, err := extractGeminiStructuredJSON(resp)
 	if err != nil {
-		slog.Error("Failed to extract Gemini structured JSON", "error", err)
+		slog.ErrorContext(ctx, "Failed to extract Gemini structured JSON", "error", err)
 		return nil, err
 	}
 
 	scores, err := parseRerankScoresStrict(rawJSON, len(documents))
 	if err != nil {
-		slog.Error("Failed to parse Gemini rerank scores", "error", err)
+		slog.ErrorContext(ctx, "Failed to parse Gemini rerank scores", "error", err)
 		return nil, err
 	}
 
-	slog.Debug("Gemini reranking complete",
+	slog.DebugContext(ctx, "Gemini reranking complete",
 		"model", c.ModelConfig.Model,
 		"num_scores", len(scores))
 
@@ -765,17 +778,4 @@ func providerOption(cfg *latest.ModelConfig, name string) string {
 		return v
 	}
 	return ""
-}
-
-// isGemini3PlusModel returns true if the lowercased model name is a Gemini 3+
-// model. It matches both "gemini-3-<family>" and "gemini-3.X-<family>" patterns.
-// NOTE: keep in sync with gemini3Family in pkg/model/provider/provider.go.
-func isGemini3PlusModel(model string) bool {
-	if !strings.HasPrefix(model, "gemini-3") {
-		return false
-	}
-	rest := model[len("gemini-3"):]
-	// "gemini-3-pro" → rest = "-pro"
-	// "gemini-3.1-flash" → rest = ".1-flash"
-	return rest != "" && (rest[0] == '-' || (rest[0] == '.' && strings.Contains(rest, "-")))
 }

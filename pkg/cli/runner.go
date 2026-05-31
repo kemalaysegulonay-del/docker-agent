@@ -3,7 +3,6 @@ package cli
 import (
 	"cmp"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -104,7 +103,16 @@ func Run(ctx context.Context, out *Printer, cfg Config, rt runtime.Runtime, sess
 			return nil
 		}
 
-		sess.AddMessage(PrepareUserMessage(ctx, rt, userInput, cfg.AttachmentPath))
+		userMsg, attachedPath, err := PrepareUserMessage(ctx, rt, userInput, cfg.AttachmentPath)
+		if err != nil {
+			return fmt.Errorf("failed to prepare message: %w", err)
+		}
+		if userMsg == nil {
+			// Agent-only command with no content - agent switched but no message to send
+			return nil
+		}
+		sess.AddMessage(userMsg)
+		sess.AddAttachedFile(attachedPath)
 
 		if cfg.OutputJSON {
 			for event := range rt.RunStream(ctx, sess) {
@@ -222,9 +230,9 @@ func Run(ctx context.Context, out *Printer, cfg Config, rt runtime.Runtime, sess
 					}
 				}
 			case *runtime.ElicitationRequestEvent:
-				serverURL, ok := e.Meta["cagent/server_url"].(string)
+				serverURL, ok := e.Meta["docker-agent/server_url"].(string)
 				if !ok || serverURL == "" {
-					slog.Warn("Skipping elicitation: missing or invalid server_url (non-interactive session?)")
+					slog.WarnContext(ctx, "Skipping elicitation: missing or invalid server_url (non-interactive session?)")
 					_ = rt.ResumeElicitation(ctx, "decline", nil)
 					return nil
 				}
@@ -314,16 +322,39 @@ func Run(ctx context.Context, out *Printer, cfg Config, rt runtime.Runtime, sess
 // a user message with optional image attachment. This is the common flow for
 // both TUI and CLI modes.
 //
+// PrepareUserMessage resolves commands, parses /attach directives, and creates
+// a user message with optional image attachment. This is the common flow for
+// both TUI and CLI modes.
+//
 // Parameters:
 //   - ctx: context for command resolution
 //   - rt: runtime for command resolution
 //   - userInput: the raw user input (may contain /commands and /attach directives)
 //   - globalAttachPath: attachment path from --attach flag (can be empty)
 //
-// Returns the prepared session.Message ready to be added to the session.
-func PrepareUserMessage(ctx context.Context, rt runtime.Runtime, userInput, globalAttachPath string) *session.Message {
-	// Resolve any /command to its prompt text
+// Returns the prepared session.Message ready to be added to the session, plus
+// the absolute path of the file that was actually attached (empty when no
+// attachment was used), and an error if agent switching fails. Callers should
+// pass the attachment path to session.Session.AddAttachedFile so sub-agents
+// inherit the file context.
+func PrepareUserMessage(ctx context.Context, rt runtime.Runtime, userInput, globalAttachPath string) (*session.Message, string, error) {
+	// Resolve any /command to its prompt text BEFORE switching agents.
+	// This ensures the command is looked up in the original agent's command table.
 	resolvedContent := runtime.ResolveCommand(ctx, rt, userInput)
+
+	// Switch the active agent if the /command targets a sub-agent.
+	// This must happen before the message is added to the session so the
+	// next runtime turn runs on the right agent.
+	if cmd, _, ok := runtime.LookupCommand(ctx, rt, userInput); ok && cmd.Agent != "" {
+		if err := rt.SetCurrentAgent(cmd.Agent); err != nil {
+			slog.WarnContext(ctx, "Failed to switch agent for /command", "agent", cmd.Agent, "error", err)
+			return nil, "", fmt.Errorf("switch agent %q: %w", cmd.Agent, err)
+		}
+		// Agent-only command with no trailing args: switch but send no message.
+		if resolvedContent == "" {
+			return nil, "", nil
+		}
+	}
 
 	// Parse for /attach commands in the message
 	messageText, attachPath := ParseAttachCommand(resolvedContent)
@@ -331,11 +362,10 @@ func PrepareUserMessage(ctx context.Context, rt runtime.Runtime, userInput, glob
 	// Use either the per-message attachment or the global one
 	finalAttachPath := cmp.Or(attachPath, globalAttachPath)
 
-	return CreateUserMessageWithAttachment(messageText, finalAttachPath)
+	msg, attachedPath := CreateUserMessageWithAttachment(ctx, messageText, finalAttachPath)
+	return msg, attachedPath, nil
 }
 
-// ParseAttachCommand parses user input for /attach commands
-// Returns the message text (with /attach commands removed) and the attachment path
 func ParseAttachCommand(userInput string) (messageText, attachPath string) {
 	lines := strings.Split(userInput, "\n")
 	var messageLines []string
@@ -389,47 +419,54 @@ func ParseAttachCommand(userInput string) (messageText, attachPath string) {
 }
 
 // CreateUserMessageWithAttachment creates a user message with optional file attachment.
-// Text files are inlined directly as text content for cross-provider compatibility.
-// Binary files (images, PDFs) are stored as file references for provider-specific upload.
-func CreateUserMessageWithAttachment(userContent, attachmentPath string) *session.Message {
-	if attachmentPath == "" {
-		return session.UserMessage(userContent)
+// All attachment processing (MIME detection, image resize, text inlining) is delegated
+// to [chat.ProcessAttachment], which runs once at message-assembly time.
+//
+// Returns the prepared session.Message and the absolute path of the file that
+// was actually attached. The returned path is empty when no attachment was
+// produced (no path supplied, file unreadable, type unsupported, file too
+// large to inline, etc.). Callers should record successful attachments via
+// session.Session.AddAttachedFile so sub-agents inherit the file context.
+func CreateUserMessageWithAttachment(ctx context.Context, userContent, attachmentPath string) (*session.Message, string) {
+	// noAttachment returns the message without any attachment.
+	noAttachment := func() (*session.Message, string) {
+		return session.UserMessage(userContent), ""
 	}
 
-	// Validate file exists
+	if attachmentPath == "" {
+		return noAttachment()
+	}
+
 	absPath, err := filepath.Abs(attachmentPath)
 	if err != nil {
-		slog.Warn("Failed to get absolute path for attachment", "path", attachmentPath, "error", err)
-		return session.UserMessage(userContent)
+		slog.WarnContext(ctx, "Failed to get absolute path for attachment", "path", attachmentPath, "error", err)
+		return noAttachment()
 	}
 
 	fi, err := os.Stat(absPath)
 	if err != nil {
-		slog.Warn("Attachment file not accessible", "path", absPath, "error", err)
-		return session.UserMessage(userContent)
+		slog.WarnContext(ctx, "Attachment file not accessible", "path", absPath, "error", err)
+		return noAttachment()
 	}
 
-	// Ensure we have some text content when attaching a file
+	// Ensure we have some text content when attaching a file.
 	textContent := cmp.Or(strings.TrimSpace(userContent), "Please analyze this attached file.")
 
 	multiContent := []chat.MessagePart{
-		{
-			Type: chat.MessagePartTypeText,
-			Text: textContent,
-		},
+		{Type: chat.MessagePartTypeText, Text: textContent},
 	}
 
 	switch {
 	case chat.IsTextFile(absPath):
 		// Text files are inlined directly as text content.
 		if fi.Size() > chat.MaxInlineFileSize {
-			slog.Warn("Attachment text file too large to inline", "path", absPath, "size", fi.Size())
-			return session.UserMessage(userContent)
+			slog.WarnContext(ctx, "Attachment text file too large to inline", "path", absPath, "size", fi.Size())
+			return noAttachment()
 		}
 		content, err := chat.ReadFileForInline(absPath)
 		if err != nil {
-			slog.Warn("Failed to read attachment file", "path", absPath, "error", err)
-			return session.UserMessage(userContent)
+			slog.WarnContext(ctx, "Failed to read attachment file", "path", absPath, "error", err)
+			return noAttachment()
 		}
 		multiContent = append(multiContent, chat.MessagePart{
 			Type: chat.MessagePartTypeText,
@@ -437,45 +474,24 @@ func CreateUserMessageWithAttachment(userContent, attachmentPath string) *sessio
 		})
 
 	default:
-		// Binary files (images, PDFs) are handled based on type.
-		mimeType := chat.DetectMimeType(absPath)
-		if !chat.IsSupportedMimeType(mimeType) {
-			slog.Warn("Unsupported attachment file type", "path", absPath, "mime_type", mimeType)
-			return session.UserMessage(userContent)
+		// Binary files (images, PDFs, etc.) — delegate to ProcessAttachment.
+		if !chat.IsSupportedMimeType(chat.DetectMimeType(absPath)) {
+			slog.WarnContext(ctx, "Unsupported attachment file type", "path", absPath)
+			return noAttachment()
 		}
-		if chat.IsImageMimeType(mimeType) {
-			// Read, resize if needed, and inline as base64 data URL.
-			// This ensures cross-provider compatibility (not all providers
-			// support file references).
-			imgData, readErr := os.ReadFile(absPath)
-			if readErr != nil {
-				slog.Warn("Failed to read image attachment", "path", absPath, "error", readErr)
-				return session.UserMessage(userContent)
-			}
-			resized, resizeErr := chat.ResizeImage(imgData, mimeType)
-			if resizeErr != nil {
-				slog.Warn("Image resize failed for attachment", "path", absPath, "error", resizeErr)
-				return session.UserMessage(userContent)
-			}
-			dataURL := fmt.Sprintf("data:%s;base64,%s", resized.MimeType, base64.StdEncoding.EncodeToString(resized.Data))
-			multiContent = append(multiContent, chat.MessagePart{
-				Type: chat.MessagePartTypeImageURL,
-				ImageURL: &chat.MessageImageURL{
-					URL:    dataURL,
-					Detail: chat.ImageURLDetailAuto,
-				},
-			})
-		} else {
-			// Non-image binary files (e.g. PDFs) are kept as file references.
-			multiContent = append(multiContent, chat.MessagePart{
-				Type: chat.MessagePartTypeFile,
-				File: &chat.MessageFile{
-					Path:     absPath,
-					MimeType: mimeType,
-				},
-			})
+		doc, _, procErr := chat.ProcessAttachmentWithMetadata(chat.MessagePart{
+			Type: chat.MessagePartTypeFile,
+			File: &chat.MessageFile{Path: absPath},
+		})
+		if procErr != nil {
+			slog.WarnContext(ctx, "Failed to process attachment", "path", absPath, "error", procErr)
+			return noAttachment()
 		}
+		multiContent = append(multiContent, chat.MessagePart{
+			Type:     chat.MessagePartTypeDocument,
+			Document: &doc,
+		})
 	}
 
-	return session.UserMessage(textContent, multiContent...)
+	return session.UserMessage(textContent, multiContent...), absPath
 }

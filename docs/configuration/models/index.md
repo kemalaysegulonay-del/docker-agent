@@ -14,13 +14,16 @@ _Complete reference for defining models with providers, parameters, and reasonin
 ```yaml
 models:
   model_name:
-    provider: string # Required: openai, anthropic, google, amazon-bedrock, dmr
+    provider: string # Required. One of: openai, anthropic, google, amazon-bedrock,
+                     # dmr, mistral, xai, nebius, minimax, requesty, azure, ollama,
+                     # github-copilot, or a named provider defined under the top-level
+                     # `providers:` section.
     model: string # Required: model identifier
-    temperature: float # Optional: 0.0–1.0
+    temperature: float # Optional: 0.0–2.0 (provider-dependent; e.g. Anthropic caps at 1.0)
     max_tokens: integer # Optional: response length limit
     top_p: float # Optional: 0.0–1.0
-    frequency_penalty: float # Optional: 0.0–2.0
-    presence_penalty: float # Optional: 0.0–2.0
+    frequency_penalty: float # Optional: -2.0–2.0
+    presence_penalty: float # Optional: -2.0–2.0
     base_url: string # Optional: custom API endpoint
     token_key: string # Optional: env var for API token
     thinking_budget: string|int # Optional: reasoning effort
@@ -36,13 +39,13 @@ models:
 
 | Property              | Type       | Required | Description                                                                           |
 | --------------------- | ---------- | -------- | ------------------------------------------------------------------------------------- |
-| `provider`            | string     | ✓        | Provider: `openai`, `anthropic`, `google`, `amazon-bedrock`, `dmr`, `mistral`, `xai`  |
-| `model`               | string     | ✓        | Model name (e.g., `gpt-4o`, `claude-sonnet-4-0`, `gemini-2.5-flash`)                  |
-| `temperature`         | float      | ✗        | Randomness. `0.0` = deterministic, `1.0` = creative                                   |
+| `provider`            | string     | ✓        | Provider: `openai`, `anthropic`, `google`, `amazon-bedrock`, `dmr`, `mistral`, `xai`, `nebius`, `minimax`, `requesty`, `azure`, `ollama`, `github-copilot`, or any [named provider]({{ '/providers/custom/' | relative_url }}). |
+| `model`               | string     | ✓        | Model name (e.g., `gpt-4o`, `claude-sonnet-4-5`, `gemini-2.5-flash`)                  |
+| `temperature`         | float      | ✗        | Sampling randomness. Range is provider-dependent — typically `0.0–2.0` (Anthropic caps at `1.0`). `0.0` is deterministic. |
 | `max_tokens`          | int        | ✗        | Maximum response length in tokens                                                     |
-| `top_p`               | float      | ✗        | Nucleus sampling threshold                                                            |
-| `frequency_penalty`   | float      | ✗        | Penalize repeated tokens (0.0–2.0)                                                    |
-| `presence_penalty`    | float      | ✗        | Encourage topic diversity (0.0–2.0)                                                   |
+| `top_p`               | float      | ✗        | Nucleus sampling threshold (`0.0–1.0`)                                                |
+| `frequency_penalty`   | float      | ✗        | Penalize repeated tokens (`-2.0–2.0`)                                                 |
+| `presence_penalty`    | float      | ✗        | Encourage topic diversity (`-2.0–2.0`)                                                |
 | `base_url`            | string     | ✗        | Custom API endpoint URL (for self-hosted or proxied endpoints)                        |
 | `token_key`           | string     | ✗        | Environment variable name containing the API token (overrides provider default)       |
 | `thinking_budget`     | string/int | ✗        | Reasoning effort control                                                              |
@@ -65,7 +68,7 @@ models:
   gpt:
     provider: openai
     model: gpt-5-mini
-    thinking_budget: low # minimal | low | medium | high
+    thinking_budget: low # minimal | low | medium | high | xhigh | max | adaptive/<level>
 ```
 
 ### Anthropic
@@ -101,7 +104,7 @@ models:
   gemini3:
     provider: google
     model: gemini-3-flash
-    thinking_budget: medium # minimal | low | medium | high
+    thinking_budget: medium # minimal | low | medium | high | xhigh | max | adaptive/<level>
 ```
 
 ### Disabling Thinking
@@ -192,7 +195,30 @@ models:
       thinking_display: summarized # "summarized", "display", or "omitted"
 ```
 
-See the [Anthropic provider page](/providers/anthropic/#thinking-display) for details.
+See the [Anthropic provider page]({{ '/providers/anthropic/#thinking-display' | relative_url }}) for details.
+
+## Custom HTTP Headers
+
+For OpenAI-compatible providers (`openai`, `github-copilot`, `mistral`, `xai`,
+`nebius`, `minimax`, `ollama`, and any custom provider using the OpenAI API),
+`provider_opts.http_headers` adds arbitrary HTTP headers to every outgoing
+request:
+
+```yaml
+models:
+  my_model:
+    provider: openai
+    model: gpt-4o
+    provider_opts:
+      http_headers:
+        X-Request-Source: docker-agent
+        X-Tenant-Id: my-team
+```
+
+Header names are matched case-insensitively. The `github-copilot` provider
+automatically sets `Copilot-Integration-Id: copilot-developer-cli` — see the
+[GitHub Copilot provider page]({{ '/providers/github-copilot/' | relative_url }})
+for details.
 
 ## Examples by Provider
 
@@ -206,7 +232,7 @@ models:
   # Anthropic
   claude:
     provider: anthropic
-    model: claude-sonnet-4-0
+    model: claude-sonnet-4-5
     max_tokens: 64000
 
   # Google Gemini

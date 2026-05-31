@@ -13,7 +13,7 @@ _Connect to Language Server Protocol servers for code intelligence._
 The LSP tool connects your agent to any Language Server Protocol (LSP) server, providing comprehensive code intelligence capabilities like go-to-definition, find references, diagnostics, and more.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ What is LSP?
+<div class="callout-title">What is LSP?
 </div>
   <p>The <a href="https://microsoft.github.io/language-server-protocol/">Language Server Protocol</a> is a standard for providing language features like autocomplete, go-to-definition, and diagnostics. Most programming languages have LSP servers available.</p>
 </div>
@@ -45,7 +45,7 @@ The LSP toolset provides these tools to the agent:
 ```yaml
 agents:
   developer:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Code developer with LSP support
     instruction: You are a software developer.
     toolsets:
@@ -59,13 +59,14 @@ agents:
 
 ## Properties
 
-| Property | Type | Required | Description |
-| --- | --- | --- | --- |
-| `command` | string | ✓ | LSP server executable command |
-| `args` | array | ✗ | Command-line arguments for the LSP server |
-| `env` | object | ✗ | Environment variables for the LSP process |
-| `file_types` | array | ✗ | File extensions this LSP handles (e.g., `[".go", ".mod"]`) |
-| `version` | string | ✗ | Package reference for [auto-installing]({{ '/configuration/tools/#auto-installing-tools' | relative_url }}) the command binary |
+| Property      | Type   | Required | Description                                                                                                                  |
+| ------------- | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `command`     | string | ✓        | LSP server executable command                                                                                                |
+| `args`        | array  | ✗        | Command-line arguments for the LSP server                                                                                    |
+| `env`         | object | ✗        | Environment variables for the LSP process                                                                                    |
+| `file_types`  | array  | ✗        | File extensions this LSP handles (e.g., `[".go", ".mod"]`)                                                                   |
+| `working_dir` | string | ✗        | Working directory for the LSP server process. Relative paths are resolved against the agent's working directory. Defaults to the agent's working directory when omitted. |
+| `version`     | string | ✗        | Package reference for [auto-installing]({{ '/configuration/tools/#auto-installing-tools' | relative_url }}) the command binary |
 
 ## Common LSP Servers
 
@@ -79,6 +80,16 @@ toolsets:
     command: gopls
     version: "golang/tools@v0.21.0" # optional: auto-install if not in PATH
     file_types: [".go"]
+```
+
+If your Go module lives in a subdirectory (e.g. a monorepo where `go.mod` is under `./backend`), set `working_dir` so `gopls` is started from the module root:
+
+```yaml
+toolsets:
+  - type: lsp
+    command: gopls
+    file_types: [".go"]
+    working_dir: ./backend # gopls must be started from the module root
 ```
 
 ### TypeScript/JavaScript (typescript-language-server)
@@ -125,7 +136,7 @@ You can configure multiple LSP servers for different file types:
 ```yaml
 agents:
   polyglot:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Multi-language developer
     instruction: You are a full-stack developer.
     toolsets:
@@ -154,14 +165,16 @@ The LSP tool includes built-in instructions that guide the agent on how to use i
 5. Apply `lsp_format` after edits are complete
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Best Practice
+<div class="callout-title">Best Practice
 </div>
   <p>Always include the <code>filesystem</code> tool alongside LSP. The agent needs filesystem access to read and write code files, while LSP provides intelligence about the code.</p>
 </div>
 
 ## Capability Detection
 
-Not all LSP servers support all features. The agent uses `lsp_workspace` to discover what's available:
+Not all LSP servers support all features. During the `initialize` handshake, docker-agent reads the server's `ServerCapabilities` and **filters out the `lsp_*` tools the server does not advertise**. The model never sees, for example, `lsp_inlay_hints` against a server that doesn't support it, so it can't waste a turn calling a tool that would only fail.
+
+The agent uses `lsp_workspace` to discover what's available:
 
 ```text
 Workspace Information:
@@ -181,6 +194,19 @@ Available Capabilities:
 ...
 ```
 
+## Auto-Restart and Lifecycle
+
+LSP toolsets are managed by the same supervisor as MCP toolsets, so a crashed `gopls` (or any other language server) is reconnected automatically with exponential backoff. Use the [`lifecycle`]({{ '/configuration/tools/#toolset-lifecycle' | relative_url }}) block to tune the policy per toolset — for example, mark `gopls` as `strict` if your CI flow requires it to be available, or use `/toolset-restart gopls` from the TUI to force a reconnect when the server gets stuck.
+
+```yaml
+toolsets:
+  - type: lsp
+    command: gopls
+    file_types: [".go"]
+    lifecycle:
+      profile: resilient # default: auto-restart on crash with exponential backoff
+```
+
 ## Position Format
 
 All LSP tools use **1-based** line and character positions:
@@ -197,7 +223,7 @@ All LSP tools use **1-based** line and character positions:
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Auto-Installation
+<div class="callout-title">Auto-Installation
 </div>
   <p>docker-agent can automatically download and install LSP servers if they are not found in your PATH. Use the <code>version</code> property to specify a package, or let docker-agent auto-detect it from the command name. See <a href="{{ '/configuration/tools/#auto-installing-tools' | relative_url }}">Auto-Installing Tools</a> for details.</p>
 </div>

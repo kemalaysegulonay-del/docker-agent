@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"log/slog"
-	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -17,10 +17,20 @@ import (
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
+// nowFn returns the current time. Indirected through a package-level variable
+// so that tests can install a deterministic clock via setNowForTest.
+var nowFn = time.Now
+
+// newIDFn returns a fresh session ID. Indirected through a package-level
+// variable so that tests can install a deterministic ID generator via
+// setIDForTest.
+var newIDFn = func() string { return uuid.New().String() }
+
 const (
 	// DefaultMaxOldToolCallTokens is the default maximum number of tokens to keep from tool call
 	// arguments and results. Older tool calls beyond this budget will have their
-	// content replaced with a placeholder. Tokens are approximated as len/4.
+	// content replaced with a placeholder. Tokens are approximated by
+	// approximateTokens (len/4).
 	DefaultMaxOldToolCallTokens = 40000
 
 	// toolContentPlaceholder is the text used to replace truncated tool content
@@ -68,6 +78,11 @@ type Session struct {
 	// ID is the unique identifier for the session
 	ID string `json:"id"`
 
+	// InputID is an optional caller-supplied correlation ID read from the eval
+	// input file's "input_id" field. It is carried through to the output as-is
+	// and never used internally. The session's own "id" is always a fresh UUID.
+	InputID string `json:"input_id,omitempty"`
+
 	// Title is the title of the session, set by the runtime
 	Title string `json:"title"`
 
@@ -112,7 +127,8 @@ type Session struct {
 
 	// MaxOldToolCallTokens is the maximum number of tokens to keep from old tool call
 	// arguments and results. Older tool calls beyond this budget will have their
-	// content replaced with a placeholder. Tokens are approximated as len/4.
+	// content replaced with a placeholder. Tokens are approximated by
+	// approximateTokens (len/4).
 	// Set to -1 to disable truncation (unlimited tool content).
 	// Default: 40000 (when not configured or set to 0).
 	MaxOldToolCallTokens int `json:"max_old_tool_call_tokens,omitempty"`
@@ -136,6 +152,14 @@ type Session struct {
 	// CustomModelsUsed tracks custom models (provider/model format) used during this session.
 	// These are shown in the model picker for easy re-selection.
 	CustomModelsUsed []string `json:"custom_models_used,omitempty"`
+
+	// AttachedFiles records absolute paths of files the user attached to this
+	// session via the editor's @-mentions, the in-message /attach directive, or
+	// the CLI --attach flag. Sub-sessions created via task transfer inherit
+	// this list so that delegated agents can reference the same files without
+	// having to scan the workspace or guess from a bare filename. Paths are
+	// deduplicated and order-preserved.
+	AttachedFiles []string `json:"attached_files,omitempty"`
 
 	// ExcludedTools lists tool names that should be filtered out of the agent's
 	// tool list for this session. This is used by skill sub-sessions to prevent
@@ -204,7 +228,7 @@ func UserMessage(content string, multiContent ...chat.MessagePart) *Message {
 			Role:         chat.MessageRoleUser,
 			Content:      content,
 			MultiContent: multiContent,
-			CreatedAt:    time.Now().Format(time.RFC3339),
+			CreatedAt:    nowFn().Format(time.RFC3339),
 		},
 	}
 }
@@ -221,7 +245,7 @@ func SystemMessage(content string) *Message {
 		Message: chat.Message{
 			Role:      chat.MessageRoleSystem,
 			Content:   content,
-			CreatedAt: time.Now().Format(time.RFC3339),
+			CreatedAt: nowFn().Format(time.RFC3339),
 		},
 	}
 }
@@ -309,18 +333,35 @@ func (e *EvalCriteria) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// deepCopyMessage returns a deep copy of a session Message.
+// cloneMessage returns a deep copy of a session Message.
 // It copies the inner chat.Message's slice and pointer fields so that the
 // returned value shares no mutable state with the original.
-func deepCopyMessage(m *Message) *Message {
+func cloneMessage(m *Message) *Message {
 	cp := *m
-	cp.Message = deepCopyChatMessage(m.Message)
+	cp.Message = cloneChatMessage(m.Message)
 	return &cp
 }
 
-// deepCopyChatMessage returns a deep copy of a chat.Message, duplicating
+// snapshotItems returns a copy of s.Messages safe to use without holding
+// s.mu. Each Message value is deep-copied so concurrent UpdateMessage calls
+// cannot mutate the snapshot; non-Message fields (Summary, SubSession, Cost,
+// FirstKeptEntry) are shallow-copied since they are not mutated in place.
+func (s *Session) snapshotItems() []Item {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	items := make([]Item, len(s.Messages))
+	for i, item := range s.Messages {
+		items[i] = item
+		if item.Message != nil {
+			items[i].Message = cloneMessage(item.Message)
+		}
+	}
+	return items
+}
+
+// cloneChatMessage returns a deep copy of a chat.Message, duplicating
 // all slice and pointer fields that would otherwise alias the original.
-func deepCopyChatMessage(m chat.Message) chat.Message {
+func cloneChatMessage(m chat.Message) chat.Message {
 	if m.MultiContent != nil {
 		orig := m.MultiContent
 		m.MultiContent = make([]chat.MessagePart, len(orig))
@@ -365,6 +406,36 @@ func (s *Session) AddMessage(msg *Message) {
 	s.mu.Unlock()
 }
 
+// SetUsage records cumulative input/output token counts under s.mu.
+// The runtime stream goroutine and the persistence observer race on
+// these fields without it.
+func (s *Session) SetUsage(input, output int64) {
+	s.mu.Lock()
+	s.InputTokens = input
+	s.OutputTokens = output
+	s.mu.Unlock()
+}
+
+// Usage returns a consistent snapshot of the cumulative input/output
+// token counts.
+func (s *Session) Usage() (input, output int64) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.InputTokens, s.OutputTokens
+}
+
+// ApplyCompaction atomically resets the session's cumulative token
+// counts and appends a summary item under s.mu so concurrent readers
+// (e.g. the persistence observer's UpdateSession snapshot) cannot
+// observe the new tokens without the matching summary item.
+func (s *Session) ApplyCompaction(inputTokens, outputTokens int64, item Item) {
+	s.mu.Lock()
+	s.InputTokens = inputTokens
+	s.OutputTokens = outputTokens
+	s.Messages = append(s.Messages, item)
+	s.mu.Unlock()
+}
+
 // AddSubSession adds a sub-session to the session
 func (s *Session) AddSubSession(subSession *Session) {
 	s.mu.Lock()
@@ -402,16 +473,7 @@ func (s *Session) AllowedDirectories() []string {
 
 // GetAllMessages extracts all messages from the session, including from sub-sessions
 func (s *Session) GetAllMessages() []Message {
-	s.mu.RLock()
-	items := make([]Item, len(s.Messages))
-	for i, item := range s.Messages {
-		if item.Message != nil {
-			items[i] = Item{Message: deepCopyMessage(item.Message)}
-		} else {
-			items[i] = item
-		}
-	}
-	s.mu.RUnlock()
+	items := s.snapshotItems()
 
 	var messages []Message
 	for _, item := range items {
@@ -458,9 +520,9 @@ func (s *Session) GetLastUserMessages(n int) []string {
 
 func (s *Session) getLastMessageContentByRole(role chat.MessageRole) string {
 	messages := s.GetAllMessages()
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Message.Role == role {
-			return strings.TrimSpace(messages[i].Message.Content)
+	for _, message := range slices.Backward(messages) {
+		if message.Message.Role == role {
+			return strings.TrimSpace(message.Message.Content)
 		}
 	}
 	return ""
@@ -480,6 +542,39 @@ func (s *Session) AddMessageUsageRecord(agentName, model string, cost float64, u
 		Cost:      cost,
 		Usage:     *usage,
 	})
+}
+
+// AddAttachedFile records absPath as a file the user attached to this session.
+// The path must be absolute; relative paths are silently dropped (with a debug
+// log) since they would be ambiguous to sub-agents started in a fresh working
+// directory. Empty paths and duplicates already present in AttachedFiles are
+// also dropped.
+//
+// The recorded paths are propagated to sub-sessions created via task transfer
+// so that delegated agents can read the same files without having to scan the
+// workspace or guess from a bare filename.
+func (s *Session) AddAttachedFile(absPath string) {
+	if absPath == "" {
+		return
+	}
+	if !filepath.IsAbs(absPath) {
+		slog.Debug("ignoring non-absolute attached file path", "session_id", s.ID, "path", absPath)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if slices.Contains(s.AttachedFiles, absPath) {
+		return
+	}
+	s.AttachedFiles = append(s.AttachedFiles, absPath)
+}
+
+// AttachedFilesSnapshot returns a copy of the session's attached file paths.
+// Callers may freely mutate the returned slice without affecting the session.
+func (s *Session) AttachedFilesSnapshot() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.AttachedFiles)
 }
 
 type Opt func(s *Session)
@@ -609,6 +704,17 @@ func WithExcludedTools(names []string) Opt {
 	}
 }
 
+// WithAttachedFiles seeds the session with absolute paths of files the user
+// attached. Used when creating sub-sessions so that delegated agents inherit
+// the parent's file context. Empty and duplicate paths are dropped.
+func WithAttachedFiles(paths []string) Opt {
+	return func(s *Session) {
+		for _, p := range paths {
+			s.AddAttachedFile(p)
+		}
+	}
+}
+
 // IsSubSession returns true if this session is a sub-session (has a parent).
 func (s *Session) IsSubSession() bool {
 	return s.ParentID != ""
@@ -669,8 +775,8 @@ func (s *Session) OwnCost() float64 {
 // New creates a new agent session
 func New(opts ...Opt) *Session {
 	s := &Session{
-		ID:              uuid.New().String(),
-		CreatedAt:       time.Now(),
+		ID:              newIDFn(),
+		CreatedAt:       nowFn(),
 		SendUserMessage: true,
 	}
 
@@ -714,7 +820,7 @@ func buildInvariantSystemMessages(a *agent.Agent) []chat.Message {
 
 		messages = append(messages, chat.Message{
 			Role:    chat.MessageRoleSystem,
-			Content: "You are a multi-agent system, make sure to answer the user query in the most helpful way possible. You have access to these sub-agents:\n" + text.String() + "\nIMPORTANT: You can ONLY transfer tasks to the agents listed above using their ID. The valid agent names are: " + strings.Join(validAgentIDs, ", ") + ". You MUST NOT attempt to transfer to any other agent IDs - doing so will cause system errors.\n\nIf you are the best to answer the question according to your description, you can answer it.\n\nIf another agent is better for answering the question according to its description, call `transfer_task` function to transfer the question to that agent using the agent's ID. When transferring, do not generate any text other than the function call.\n\n",
+			Content: "You are a multi-agent system, make sure to answer the user query in the most helpful way possible. You have access to these sub-agents:\n" + text.String() + "\nIMPORTANT: You can ONLY transfer tasks to the agents listed above using their ID. The valid agent names are: " + strings.Join(validAgentIDs, ", ") + ". You MUST NOT attempt to transfer to any other agent IDs - doing so will cause system errors.\n\nIf you are the best to answer the question according to your description, you can answer it.\n\nIf another agent is better for answering the question according to its description, call `transfer_task` function to transfer the question to that agent using the agent's ID. When transferring, do not generate any text other than the function call.\n\nWhen the task involves files, always include their absolute paths in the `task` description (never just bare filenames). Sub-agents start in a fresh session and do not see the conversation history or files attached by the user, so a non-absolute path may resolve to the wrong file or force the sub-agent to scan the filesystem.\n\n",
 		})
 	}
 
@@ -767,58 +873,6 @@ func buildInvariantSystemMessages(a *agent.Agent) []chat.Message {
 	return messages
 }
 
-// buildContextSpecificSystemMessages builds system messages that vary
-// per user, project, or time. These messages should come after
-// the invariant checkpoint to maintain optimal caching behavior.
-//
-// These messages depend on runtime context (working directory, current date,
-// user-specific skills) and cannot be cached across sessions or users.
-// Note: Session summary is handled separately in buildSessionSummaryMessages.
-func buildContextSpecificSystemMessages(a *agent.Agent, s *Session) []chat.Message {
-	var messages []chat.Message
-
-	if a.AddDate() {
-		messages = append(messages, chat.Message{
-			Role:    chat.MessageRoleSystem,
-			Content: "Today's date: " + time.Now().Format("2006-01-02"),
-		})
-	}
-
-	wd := s.WorkingDir
-	if wd == "" {
-		var err error
-		wd, err = os.Getwd()
-		if err != nil {
-			slog.Error("getting current working directory for environment info", "error", err)
-		}
-	}
-	if wd != "" {
-		if a.AddEnvironmentInfo() {
-			messages = append(messages, chat.Message{
-				Role:    chat.MessageRoleSystem,
-				Content: getEnvironmentInfo(wd),
-			})
-		}
-
-		for _, prompt := range a.AddPromptFiles() {
-			additionalPrompts, err := readPromptFiles(wd, prompt)
-			if err != nil {
-				slog.Error("reading prompt file", "file", prompt, "error", err)
-				continue
-			}
-
-			for _, additionalPrompt := range additionalPrompts {
-				messages = append(messages, chat.Message{
-					Role:    chat.MessageRoleSystem,
-					Content: additionalPrompt,
-				})
-			}
-		}
-	}
-
-	return messages
-}
-
 // buildSessionSummaryMessages builds system messages containing the session summary
 // if one exists. Session summaries are context-specific per session and thus should not have a checkpoint (they will be cached alongside the first user message anyway)
 //
@@ -832,7 +886,7 @@ func buildSessionSummaryMessages(items []Item) ([]chat.Message, int) {
 	// Find the last summary index to determine where conversation messages start
 	// and to include the summary in session summary messages
 	lastSummaryIndex := -1
-	for i := len(items) - 1; i >= 0; i-- {
+	for i := range slices.Backward(items) {
 		if items[i].Summary != "" {
 			lastSummaryIndex = i
 			break
@@ -843,7 +897,7 @@ func buildSessionSummaryMessages(items []Item) ([]chat.Message, int) {
 		messages = append(messages, chat.Message{
 			Role:      chat.MessageRoleUser,
 			Content:   "Session Summary: " + items[lastSummaryIndex].Summary,
-			CreatedAt: time.Now().Format(time.RFC3339),
+			CreatedAt: nowFn().Format(time.RFC3339),
 		})
 	}
 
@@ -861,36 +915,113 @@ func buildSessionSummaryMessages(items []Item) ([]chat.Message, int) {
 	return messages, startIndex
 }
 
-func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
+// CompactionInput returns the chat messages that the compactor should
+// summarize together with their origin indices in s.Messages. The
+// returned messages are independent copies safe for the caller to
+// mutate (cloned via snapshotItems); the parallel sessIndices slice
+// maps each entry back to its source item so the caller can compute a
+// FirstKeptEntry that survives prior summaries in the history.
+//
+// When the session contains a prior summary, the result begins with a
+// synthetic "Session Summary: ..." user message whose origin index is
+// the prior summary item itself; subsequent entries are the prior
+// kept-tail and the post-summary conversation, mirroring what
+// buildSessionSummaryMessages produces for the runtime. System
+// messages stored on the session are filtered out (the compactor
+// supplies its own system/user prompt around this list).
+//
+// This method intentionally bypasses GetMessages's agent-level
+// transformations — invariant system prompts, NumHistoryItems
+// trimming, old-tool-content truncation, whitespace normalization,
+// orphan-tool-call sanitization, and cache_control marking. None of
+// those belong in compaction input: the compactor needs the full,
+// untrimmed history (so the LLM can summarize what trimming would
+// have hidden), supplies its own system/user prompt, and runs through
+// a sub-runtime that re-applies sanitization on its own session.
+//
+// All work is performed under s.mu.RLock via snapshotItems, so this
+// method is safe to call concurrently with AddMessage / ApplyCompaction
+// on the same session.
+func (s *Session) CompactionInput() ([]chat.Message, []int) {
+	items := s.snapshotItems()
+
+	lastSummaryIndex := -1
+	for i := range slices.Backward(items) {
+		if items[i].Summary != "" {
+			lastSummaryIndex = i
+			break
+		}
+	}
+
+	var (
+		messages    []chat.Message
+		sessIndices []int
+	)
+
+	if lastSummaryIndex >= 0 {
+		messages = append(messages, chat.Message{
+			Role:      chat.MessageRoleUser,
+			Content:   "Session Summary: " + items[lastSummaryIndex].Summary,
+			CreatedAt: nowFn().Format(time.RFC3339),
+		})
+		// The synthetic message stands in for the prior summary item;
+		// when this index lands inside the kept tail we want the
+		// summary item itself preserved so the next compaction round
+		// still sees it via buildSessionSummaryMessages.
+		sessIndices = append(sessIndices, lastSummaryIndex)
+	}
+
+	startIndex := lastSummaryIndex + 1
+	if lastSummaryIndex >= 0 {
+		kept := items[lastSummaryIndex].FirstKeptEntry
+		if kept > 0 && kept < lastSummaryIndex {
+			startIndex = kept
+		}
+	}
+
+	for i := startIndex; i < len(items); i++ {
+		if !items[i].IsMessage() {
+			continue
+		}
+		msg := items[i].Message.Message
+		if msg.Role == chat.MessageRoleSystem {
+			continue
+		}
+		messages = append(messages, msg)
+		sessIndices = append(sessIndices, i)
+	}
+	return messages, sessIndices
+}
+
+func (s *Session) GetMessages(a *agent.Agent, extraSystemMessages ...chat.Message) []chat.Message {
 	slog.Debug("Getting messages for agent", "agent", a.Name(), "session_id", s.ID)
 
 	// Build invariant system messages (cacheable across sessions/users/projects)
 	invariantMessages := buildInvariantSystemMessages(a)
 	markLastMessageAsCacheControl(invariantMessages)
 
-	// Build context-specific system messages (vary per user/project/time)
-	contextMessages := buildContextSpecificSystemMessages(a, s)
-	markLastMessageAsCacheControl(contextMessages)
-
 	// Take a snapshot of Messages under the lock, copying Message structs
 	// to avoid racing with UpdateMessage which may modify the pointed-to objects.
-	s.mu.RLock()
-	items := make([]Item, len(s.Messages))
-	for i, item := range s.Messages {
-		if item.Message != nil {
-			items[i] = Item{Message: deepCopyMessage(item.Message), Summary: item.Summary, SubSession: item.SubSession, Cost: item.Cost}
-		} else {
-			items[i] = item
-		}
-	}
-	s.mu.RUnlock()
+	items := s.snapshotItems()
 
 	// Build session summary messages (vary per session)
 	summaryMessages, startIndex := buildSessionSummaryMessages(items)
 
 	var messages []chat.Message
 	messages = append(messages, invariantMessages...)
-	messages = append(messages, contextMessages...)
+	// extraSystemMessages are caller-supplied transient system messages
+	// (e.g. turn_start hook output) inserted after the invariant cache
+	// checkpoint and before the conversation. The last extra carries a
+	// cache_control marker so that stable per-session/per-day extras
+	// (AddPromptFiles, AddEnvironmentInfo) participate in prompt caching.
+	// Volatile extras (the daily date) live behind the same marker, which
+	// is acceptable: the cache simply rotates when the date rolls over,
+	// matching the behavior of the previous inline
+	// buildContextSpecificSystemMessages path.
+	if len(extraSystemMessages) > 0 {
+		messages = append(messages, extraSystemMessages...)
+		markLastMessageAsCacheControl(messages[len(messages)-len(extraSystemMessages):])
+	}
 	messages = append(messages, summaryMessages...)
 
 	// Begin adding conversation messages
@@ -916,6 +1047,7 @@ func (s *Session) GetMessages(a *agent.Agent) []chat.Message {
 		messages = truncateOldToolContent(messages, maxOldToolCallTokens)
 	}
 
+	messages = normalizeMessageContent(messages)
 	messages = sanitizeToolCalls(messages)
 
 	systemCount := 0
@@ -1013,6 +1145,58 @@ func trimMessages(messages []chat.Message, maxItems int) []chat.Message {
 	return result
 }
 
+// normalizeMessageContent strips purely-whitespace content from messages before
+// they reach any provider converter. Specifically:
+//
+//   - Non-tool messages whose Content is whitespace-only and have no MultiContent
+//     are dropped entirely. Tool-result messages are exempt: every tool_use must
+//     have a corresponding tool_result, so we cannot skip them even when empty.
+//   - Text parts inside MultiContent whose Text is whitespace-only are removed.
+//     A non-tool message that becomes part-less after this pruning is also dropped.
+//
+// This is the single authoritative guard; individual provider converters do not
+// need their own whitespace-skip guards for user/system/assistant messages.
+func normalizeMessageContent(messages []chat.Message) []chat.Message {
+	out := messages[:0:0]          // reuse underlying array, length 0
+	for _, msg := range messages { // Tool results must always be forwarded — even empty — because the API
+		// requires a tool_result for every preceding tool_use block.
+		if msg.Role == chat.MessageRoleTool {
+			out = append(out, msg)
+			continue
+		}
+
+		if len(msg.MultiContent) > 0 {
+			// Filter whitespace-only text parts; preserve image/file parts as-is.
+			filtered := msg.MultiContent[:0:0]
+			for _, part := range msg.MultiContent {
+				if part.Type == chat.MessagePartTypeText && strings.TrimSpace(part.Text) == "" {
+					continue
+				}
+				filtered = append(filtered, part)
+			}
+			if len(filtered) == 0 {
+				// All parts were whitespace-only text — drop the whole message.
+				continue
+			}
+			msg.MultiContent = filtered
+			out = append(out, msg)
+			continue
+		}
+
+		// Single-part: drop messages with whitespace-only Content, but only when
+		// there are no tool calls or function calls attached. An assistant message
+		// with an empty text body but tool_use blocks is valid and must be kept.
+		if strings.TrimSpace(msg.Content) == "" && len(msg.ToolCalls) == 0 && msg.FunctionCall == nil {
+			continue
+		}
+		out = append(out, msg)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // sanitizeToolCalls ensures every tool call in assistant messages has a
 // corresponding tool-result message. It walks the message list tracking
 // pending tool calls; when a tool-result message arrives its ID is marked
@@ -1066,6 +1250,15 @@ func sanitizeToolCalls(messages []chat.Message) []chat.Message {
 	return out
 }
 
+// approximateTokens returns a coarse token count for a string, using the
+// industry rule-of-thumb of ~4 characters per token. The heuristic is good
+// enough for budgeting tool-content truncation; we do not need provider-exact
+// counts here. Centralised so tests can reason about budgets without
+// hard-coding the divisor.
+func approximateTokens(s string) int {
+	return len(s) / 4
+}
+
 // truncateOldToolContent replaces tool results with placeholders for older
 // messages that exceed the token budget. It processes messages from newest to
 // oldest, keeping recent tool content intact while truncating older content
@@ -1080,11 +1273,11 @@ func truncateOldToolContent(messages []chat.Message, maxTokens int) []chat.Messa
 
 	tokenBudget := maxTokens
 
-	for i := len(result) - 1; i >= 0; i-- {
+	for i := range slices.Backward(result) {
 		msg := &result[i]
 
 		if msg.Role == chat.MessageRoleTool {
-			tokens := len(msg.Content) / 4
+			tokens := approximateTokens(msg.Content)
 			if tokenBudget >= tokens {
 				tokenBudget -= tokens
 			} else {

@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/docker/docker-agent/pkg/config"
+	"github.com/docker/docker-agent/pkg/tui/styles"
 	"github.com/docker/docker-agent/pkg/userconfig"
 )
 
@@ -71,7 +72,16 @@ func completeMessage(cmd *cobra.Command, args []string, toComplete string) ([]st
 
 	agent, _ := cmd.Flags().GetString("agent")
 	if agent == "" {
-		agent = "root"
+		if len(cfg.Agents) == 0 {
+			return nil, cobra.ShellCompDirectiveNoFileComp
+		}
+		// Mirror team.DefaultAgent: prefer "root" when present, otherwise
+		// the first agent declared. This keeps shell completion in sync
+		// with the agent the runtime would actually run.
+		agent = cfg.Agents[0].Name
+		if _, hasRoot := cfg.Agents.Lookup("root"); hasRoot {
+			agent = "root"
+		}
 	}
 	agentCfg, found := cfg.Agents.Lookup(agent)
 	if !found {
@@ -82,6 +92,22 @@ func completeMessage(cmd *cobra.Command, args []string, toComplete string) ([]st
 	for k, v := range agentCfg.Commands {
 		if strings.HasPrefix("/"+k, toComplete) {
 			candidates = append(candidates, "/"+k+"\t"+v.DisplayText())
+		}
+	}
+
+	return candidates, cobra.ShellCompDirectiveNoFileComp
+}
+
+func completeTheme(_ *cobra.Command, _ []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	refs, err := styles.ListThemeRefs()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	var candidates []string
+	for _, ref := range refs {
+		if strings.HasPrefix(ref, toComplete) {
+			candidates = append(candidates, ref)
 		}
 	}
 

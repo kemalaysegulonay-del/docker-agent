@@ -5,13 +5,16 @@ This file contains shared message conversion utilities for OpenAI-compatible pro
 */
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/packages/param"
 
 	"github.com/docker/docker-agent/pkg/chat"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 )
 
 // JSONSchema is a helper type that implements json.Marshaler for map[string]any.
@@ -23,28 +26,47 @@ func (j JSONSchema) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]any(j))
 }
 
-// ConvertMultiContent converts chat.MessagePart slices to OpenAI content parts.
-func ConvertMultiContent(multiContent []chat.MessagePart) []openai.ChatCompletionContentPartUnionParam {
-	parts := make([]openai.ChatCompletionContentPartUnionParam, len(multiContent))
-	for i, part := range multiContent {
+// ConvertMultiContent converts chat.MessagePart slices to OpenAI content
+// parts using the provided modelsdev.Store for capability lookups.
+func ConvertMultiContent(ctx context.Context, multiContent []chat.MessagePart, id modelsdev.ID, store *modelsdev.Store) []openai.ChatCompletionContentPartUnionParam {
+	return convertMultiContentWithStore(ctx, multiContent, id, store)
+}
+
+// ConvertMessages converts chat.Message slices to OpenAI message params
+// using the provided modelsdev.Store for capability lookups.
+func ConvertMessages(ctx context.Context, messages []chat.Message, id modelsdev.ID, store *modelsdev.Store) []openai.ChatCompletionMessageParamUnion {
+	return convertMessagesWithStore(ctx, messages, id, store)
+}
+
+func convertMultiContentWithStore(ctx context.Context, multiContent []chat.MessagePart, id modelsdev.ID, store *modelsdev.Store) []openai.ChatCompletionContentPartUnionParam {
+	parts := make([]openai.ChatCompletionContentPartUnionParam, 0, len(multiContent))
+	for _, part := range multiContent {
 		switch part.Type {
 		case chat.MessagePartTypeText:
-			parts[i] = openai.TextContentPart(part.Text)
+			parts = append(parts, openai.TextContentPart(part.Text))
 		case chat.MessagePartTypeImageURL:
+			// Note: superseded by MessagePartTypeDocument.
 			if part.ImageURL != nil {
-				parts[i] = openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
+				parts = append(parts, openai.ImageContentPart(openai.ChatCompletionContentPartImageImageURLParam{
 					URL:    part.ImageURL.URL,
 					Detail: string(part.ImageURL.Detail),
-				})
+				}))
+			}
+		case chat.MessagePartTypeDocument:
+			if part.Document != nil {
+				docParts, err := convertDocument(ctx, *part.Document, id, store)
+				if err != nil {
+					slog.WarnContext(ctx, "failed to convert document attachment", "error", err, "doc", part.Document.Name)
+					continue
+				}
+				parts = append(parts, docParts...)
 			}
 		}
 	}
 	return parts
 }
 
-// ConvertMessages converts chat.Message slices to OpenAI message params.
-// This is the base conversion without any provider-specific post-processing.
-func ConvertMessages(messages []chat.Message) []openai.ChatCompletionMessageParamUnion {
+func convertMessagesWithStore(ctx context.Context, messages []chat.Message, id modelsdev.ID, store *modelsdev.Store) []openai.ChatCompletionMessageParamUnion {
 	openaiMessages := make([]openai.ChatCompletionMessageParamUnion, 0, len(messages))
 	for i := range messages {
 		msg := &messages[i]
@@ -77,7 +99,7 @@ func ConvertMessages(messages []chat.Message) []openai.ChatCompletionMessagePara
 			if len(msg.MultiContent) == 0 {
 				openaiMessage = openai.UserMessage(msg.Content)
 			} else {
-				openaiMessage = openai.UserMessage(ConvertMultiContent(msg.MultiContent))
+				openaiMessage = openai.UserMessage(convertMultiContentWithStore(ctx, msg.MultiContent, id, store))
 			}
 
 		case chat.MessageRoleAssistant:

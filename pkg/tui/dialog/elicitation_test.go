@@ -1,8 +1,10 @@
 package dialog
 
 import (
+	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -572,4 +574,196 @@ func TestElicitationDialog_collectAndValidate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestElicitationDialog_LongEnumScrolls(t *testing.T) {
+	t.Parallel()
+
+	// Build an enum with many values that would overflow a typical terminal.
+	enumValues := make([]any, 0, 30)
+	for i := range 30 {
+		enumValues = append(enumValues, "option-"+strings.Repeat("x", 5)+string(rune('A'+i%26)))
+	}
+
+	schema := map[string]any{
+		"type":  "string",
+		"title": "Pick one",
+		"enum":  enumValues,
+	}
+
+	dialog := NewElicitationDialog("Choose an option:", schema, nil).(*ElicitationDialog)
+	require.Len(t, dialog.fields, 1)
+	require.Len(t, dialog.fields[0].EnumValues, 30)
+
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+	_ = dialog.View() // populate fieldStarts and configure the scrollview
+
+	require.Len(t, dialog.fieldStarts, 1)
+	assert.True(t, dialog.scrollview.NeedsScrollbar(), "30 enum options on a 20-row terminal must require scrolling")
+
+	// Selecting an option far down the list must auto-scroll it into view.
+	dialog.enumIndexes[0] = 25
+	dialog.ensureFocusVisible()
+	_ = dialog.View()
+	offset := dialog.scrollview.ScrollOffset()
+	visEnd := offset + dialog.scrollview.VisibleHeight() - 1
+	selectedLine := dialog.fieldStarts[0] + 1 + 25
+	assert.GreaterOrEqual(t, selectedLine, offset, "selected option must be at or below scroll offset")
+	assert.LessOrEqual(t, selectedLine, visEnd, "selected option must be at or above visible end")
+}
+
+func TestElicitationDialog_FieldsBelowFold_AreReachable(t *testing.T) {
+	t.Parallel()
+
+	props := map[string]any{}
+	required := []any{}
+	for i := range 15 {
+		name := "field" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		props[name] = map[string]any{"type": "string", "title": name}
+		required = append(required, name)
+	}
+	schema := map[string]any{"type": "object", "properties": props, "required": required}
+
+	dialog := NewElicitationDialog("Fill in the form", schema, nil).(*ElicitationDialog)
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 100, Height: 18})
+	_ = dialog.View()
+
+	require.Len(t, dialog.fieldStarts, 15)
+	assert.True(t, dialog.scrollview.NeedsScrollbar(), "15 fields on an 18-row terminal must require scrolling")
+
+	// Tab through every field; each one must end up within the scroll viewport.
+	for i := range 15 {
+		for dialog.currentField != i {
+			dialog.moveFocus(1)
+		}
+		_ = dialog.View()
+		offset := dialog.scrollview.ScrollOffset()
+		visEnd := offset + dialog.scrollview.VisibleHeight() - 1
+		start := dialog.fieldStarts[i]
+		assert.GreaterOrEqual(t, start, offset, "field %d label must be at or below scroll offset", i)
+		assert.LessOrEqual(t, start, visEnd, "field %d label must be visible", i)
+	}
+}
+
+func TestElicitationDialog_SmallContent_NoScrollbar(t *testing.T) {
+	t.Parallel()
+
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string", "title": "Name"},
+		},
+		"required": []any{"name"},
+	}
+
+	dialog := NewElicitationDialog("Enter your name", schema, nil).(*ElicitationDialog)
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	_ = dialog.View()
+
+	assert.False(t, dialog.scrollview.NeedsScrollbar(), "small dialogs should not need a scrollbar")
+}
+
+// TestElicitationDialog_OpensScrolledToTop pins the contract that a freshly
+// opened elicitation dialog (e.g. user_prompt) starts scrolled all the way
+// up so the user can read the question/message from the start, even when
+// the focused option/field would otherwise pull the viewport down.
+// TestElicitationDialog_TypingRevealsBelowFoldField pins that when the user
+// starts typing into a text field that lives below the fold (because the
+// dialog opens scrolled to the top with a long message), the input is
+// scrolled into view so the user can see what they are entering.
+func TestElicitationDialog_TypingRevealsBelowFoldField(t *testing.T) {
+	t.Parallel()
+
+	longMessage := strings.Repeat("Long question line. ", 30)
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"name": map[string]any{"type": "string", "title": "Name"},
+		},
+		"required": []any{"name"},
+	}
+
+	dialog := NewElicitationDialog(longMessage, schema, nil).(*ElicitationDialog)
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 80, Height: 16})
+	_ = dialog.View()
+
+	require.True(t, dialog.scrollview.NeedsScrollbar(), "long message + field must require scrolling")
+	require.Equal(t, 0, dialog.scrollview.ScrollOffset(), "dialog must open scrolled to the top")
+	require.Len(t, dialog.fieldStarts, 1)
+
+	// The text field's input line lives below the initial viewport.
+	inputLine := dialog.fieldStarts[0] + 1
+	require.Greater(t, inputLine, dialog.scrollview.VisibleHeight()-1,
+		"test setup: the text field must initially be below the fold")
+
+	// User types a character — this must scroll the input into view.
+	_, _ = dialog.Update(tea.KeyPressMsg(tea.Key{Code: 'a', Text: "a"}))
+	_ = dialog.View()
+
+	offset := dialog.scrollview.ScrollOffset()
+	visEnd := offset + dialog.scrollview.VisibleHeight() - 1
+	assert.GreaterOrEqual(t, inputLine, offset, "input line must be at or below scroll offset after typing")
+	assert.LessOrEqual(t, inputLine, visEnd, "input line must be visible after typing")
+}
+
+func TestElicitationDialog_OpensScrolledToTop(t *testing.T) {
+	t.Parallel()
+
+	// Long question that, combined with many options, forces a scrollbar.
+	longMessage := strings.Repeat("This is a long question that takes several lines. ", 20)
+
+	enumValues := make([]any, 0, 12)
+	for i := range 12 {
+		enumValues = append(enumValues, "option-"+string(rune('A'+i)))
+	}
+
+	schema := map[string]any{
+		"type":  "string",
+		"title": "Pick one",
+		"enum":  enumValues,
+	}
+
+	dialog := NewElicitationDialog(longMessage, schema, nil).(*ElicitationDialog)
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 80, Height: 18})
+	_ = dialog.View()
+
+	require.True(t, dialog.scrollview.NeedsScrollbar(), "long question + many options must require scrolling")
+	assert.Equal(t, 0, dialog.scrollview.ScrollOffset(),
+		"dialog must open scrolled to the top so the user can read the question first")
+}
+
+// TestElicitationDialog_UserScrollUp_NotSnappedBack pins the contract that
+// once the user scrolls up (e.g. via wheel/PgUp) to read the question, the
+// next render must not snap the viewport back down to the focused option.
+func TestElicitationDialog_UserScrollUp_NotSnappedBack(t *testing.T) {
+	t.Parallel()
+
+	longMessage := strings.Repeat("Long question line. ", 30)
+	enumValues := make([]any, 0, 12)
+	for i := range 12 {
+		enumValues = append(enumValues, "option-"+string(rune('A'+i)))
+	}
+	schema := map[string]any{"type": "string", "title": "Pick one", "enum": enumValues}
+
+	dialog := NewElicitationDialog(longMessage, schema, nil).(*ElicitationDialog)
+	_, _ = dialog.Update(tea.WindowSizeMsg{Width: 80, Height: 16})
+	_ = dialog.View()
+
+	require.True(t, dialog.scrollview.NeedsScrollbar())
+
+	// Scroll all the way down (e.g. user pressed End).
+	dialog.scrollview.ScrollToBottom()
+	offsetAfterScroll := dialog.scrollview.ScrollOffset()
+	require.Positive(t, offsetAfterScroll, "scrollview should accept a non-zero offset")
+
+	// Re-render: must NOT snap back to keep the focused option visible.
+	_ = dialog.View()
+	assert.Equal(t, offsetAfterScroll, dialog.scrollview.ScrollOffset(),
+		"re-rendering must not auto-scroll; the user's scroll position must be preserved")
+
+	// Now scroll back to the top (to re-read the question).
+	dialog.scrollview.ScrollToTop()
+	_ = dialog.View()
+	assert.Equal(t, 0, dialog.scrollview.ScrollOffset(),
+		"re-rendering must not auto-scroll back down to the focused option")
 }

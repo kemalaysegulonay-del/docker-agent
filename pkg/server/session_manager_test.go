@@ -48,9 +48,19 @@ func (f *fakeRuntime) RunStream(_ context.Context, _ *session.Session) <-chan ru
 
 func (f *fakeRuntime) Resume(_ context.Context, _ runtime.ResumeRequest) {}
 
+func (f *fakeRuntime) Steer(_ runtime.QueuedMessage) error { return nil }
+
+func (f *fakeRuntime) FollowUp(_ runtime.QueuedMessage) error { return nil }
+
 func (f *fakeRuntime) ResumeElicitation(_ context.Context, _ tools.ElicitationAction, _ map[string]any) error {
 	return nil
 }
+
+func (f *fakeRuntime) CurrentAgentName() string { return "root" }
+
+// SupportsModelSwitching reports false by default. Tests that exercise
+// the /models endpoints embed fakeRuntime and override this.
+func (f *fakeRuntime) SupportsModelSwitching() bool { return false }
 
 func newTestSessionManager(t *testing.T, sess *session.Session, fake *fakeRuntime) *SessionManager {
 	t.Helper()
@@ -61,9 +71,11 @@ func newTestSessionManager(t *testing.T, sess *session.Session, fake *fakeRuntim
 
 	sm := &SessionManager{
 		runtimeSessions: concurrent.NewMap[string, *activeRuntimes](),
+		deletedSessions: concurrent.NewMap[string, *activeRuntimes](),
 		sessionStore:    store,
 		Sources:         config.Sources{},
 		runConfig:       &config.RuntimeConfig{},
+		sessionReady:    make(chan struct{}),
 	}
 
 	// Pre-register a runtime for this session so RunSession skips agent loading.
@@ -74,6 +86,25 @@ func newTestSessionManager(t *testing.T, sess *session.Session, fake *fakeRuntim
 	})
 
 	return sm
+}
+
+// TestAttachRuntime_RegistersRuntimeForExternalDriver verifies that a
+// pre-built runtime is reachable through the manager API after AttachRuntime.
+// This is what lets the TUI hand its in-process runtime to an HTTP server.
+func TestAttachRuntime_RegistersRuntimeForExternalDriver(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	store := session.NewInMemorySessionStore()
+	sess := session.New()
+	require.NoError(t, store.AddSession(ctx, sess))
+
+	sm := NewSessionManager(ctx, config.Sources{}, store, 0, &config.RuntimeConfig{})
+	fake := &fakeRuntime{streamDelay: 10 * time.Millisecond}
+	sm.AttachRuntime(sess.ID, fake, sess)
+
+	// Steer routes through the attached runtime, not a freshly built one.
+	require.NoError(t, sm.SteerSession(ctx, sess.ID, []api.Message{{Content: "hi"}}))
 }
 
 // TestRunSession_ConcurrentRequestReturnsErrSessionBusy verifies that a
@@ -90,7 +121,7 @@ func TestRunSession_ConcurrentRequestReturnsErrSessionBusy(t *testing.T) {
 	// Start the first stream.
 	ch1, err := sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 		{Content: "first"},
-	})
+	}, "")
 	require.NoError(t, err)
 
 	// Give the goroutine a moment to acquire the streaming lock.
@@ -99,7 +130,7 @@ func TestRunSession_ConcurrentRequestReturnsErrSessionBusy(t *testing.T) {
 	// The second request should fail immediately with ErrSessionBusy.
 	_, err = sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 		{Content: "second"},
-	})
+	}, "")
 	require.ErrorIs(t, err, ErrSessionBusy)
 
 	// Drain first stream to let it complete.
@@ -109,7 +140,7 @@ func TestRunSession_ConcurrentRequestReturnsErrSessionBusy(t *testing.T) {
 	// After the first stream finishes, a new request should succeed.
 	ch3, err := sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 		{Content: "third"},
-	})
+	}, "")
 	require.NoError(t, err)
 	for range ch3 {
 	}
@@ -127,7 +158,7 @@ func TestRunSession_MessagesNotAddedWhenBusy(t *testing.T) {
 
 	ch1, err := sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 		{Content: "first"},
-	})
+	}, "")
 	require.NoError(t, err)
 
 	time.Sleep(50 * time.Millisecond)
@@ -136,7 +167,7 @@ func TestRunSession_MessagesNotAddedWhenBusy(t *testing.T) {
 
 	_, err = sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 		{Content: "should not be added"},
-	})
+	}, "")
 	require.ErrorIs(t, err, ErrSessionBusy)
 
 	// Messages should not have been added.
@@ -159,7 +190,7 @@ func TestRunSession_SequentialRequestsSucceed(t *testing.T) {
 	for range 3 {
 		ch, err := sm.RunSession(ctx, sess.ID, "agent", "root", []api.Message{
 			{Content: "hello"},
-		})
+		}, "")
 		require.NoError(t, err)
 		for range ch {
 		}
@@ -185,9 +216,11 @@ func TestRunSession_DifferentSessionsConcurrently(t *testing.T) {
 
 	sm := &SessionManager{
 		runtimeSessions: concurrent.NewMap[string, *activeRuntimes](),
+		deletedSessions: concurrent.NewMap[string, *activeRuntimes](),
 		sessionStore:    store,
 		Sources:         config.Sources{},
 		runConfig:       &config.RuntimeConfig{},
+		sessionReady:    make(chan struct{}),
 	}
 
 	sm.runtimeSessions.Store(sess1.ID, &activeRuntimes{
@@ -202,7 +235,7 @@ func TestRunSession_DifferentSessionsConcurrently(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		ch, err := sm.RunSession(ctx, sess1.ID, "agent", "root", []api.Message{{Content: "a"}})
+		ch, err := sm.RunSession(ctx, sess1.ID, "agent", "root", []api.Message{{Content: "a"}}, "")
 		assert.NoError(t, err)
 		for range ch {
 		}
@@ -210,7 +243,7 @@ func TestRunSession_DifferentSessionsConcurrently(t *testing.T) {
 
 	go func() {
 		defer wg.Done()
-		ch, err := sm.RunSession(ctx, sess2.ID, "agent", "root", []api.Message{{Content: "b"}})
+		ch, err := sm.RunSession(ctx, sess2.ID, "agent", "root", []api.Message{{Content: "b"}}, "")
 		assert.NoError(t, err)
 		for range ch {
 		}

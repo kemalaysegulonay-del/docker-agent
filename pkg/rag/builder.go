@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/docker/docker-agent/pkg/config"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/environment"
 	"github.com/docker/docker-agent/pkg/model/provider"
@@ -22,6 +23,7 @@ type ManagersBuildConfig struct {
 	Env           environment.Provider
 	Models        map[string]latest.ModelConfig    // Model configurations from config
 	Providers     map[string]latest.ProviderConfig // Custom provider configurations from config
+	RuntimeConfig *config.RuntimeConfig
 }
 
 // NewProvider creates a model provider using the build config's environment,
@@ -58,6 +60,7 @@ func NewManager(
 		Env:           buildCfg.Env,
 		ModelsGateway: buildCfg.ModelsGateway,
 		RespectVCS:    ragCfg.GetRespectVCS(),
+		RuntimeConfig: buildCfg.RuntimeConfig,
 	}
 
 	strategyConfigs, strategyEvents, err := buildStrategyConfigs(ctx, *ragCfg, strategyBuildCtx, ragName)
@@ -79,7 +82,7 @@ func NewManager(
 	for i, sc := range strategyConfigs {
 		strategyNames[i] = sc.Name
 	}
-	slog.Debug("Created RAG manager",
+	slog.DebugContext(ctx, "Created RAG manager",
 		"name", ragName,
 		"strategies", strategyNames,
 		"docs", len(managerCfg.Docs))
@@ -103,20 +106,20 @@ func buildManagerConfig(
 
 	// Build reranking config if configured
 	if ragCfg.Results.Reranking != nil {
-		slog.Debug("Building reranking configuration",
+		slog.DebugContext(ctx, "Building reranking configuration",
 			"model", ragCfg.Results.Reranking.Model,
 			"top_k", ragCfg.Results.Reranking.TopK,
 			"threshold", ragCfg.Results.Reranking.Threshold)
 
 		rerankingCfg, err := buildRerankingConfig(ctx, ragCfg.Results.Reranking, buildCfg, results.Limit)
 		if err != nil {
-			slog.Error("Failed to build reranking config",
+			slog.ErrorContext(ctx, "Failed to build reranking config",
 				"model", ragCfg.Results.Reranking.Model,
 				"error", err)
 			return Config{}, fmt.Errorf("failed to build reranking config: %w", err)
 		}
 		results.RerankingConfig = rerankingCfg
-		slog.Debug("Reranking configuration built successfully",
+		slog.DebugContext(ctx, "Reranking configuration built successfully",
 			"model", ragCfg.Results.Reranking.Model)
 	}
 
@@ -147,38 +150,38 @@ func buildRerankingConfig(
 	}
 
 	if rerankCfg.Model == "" {
-		slog.Error("Reranking model name is empty")
+		slog.ErrorContext(ctx, "Reranking model name is empty")
 		return nil, errors.New("reranking model is required")
 	}
 
-	slog.Debug("Resolving reranking model",
+	slog.DebugContext(ctx, "Resolving reranking model",
 		"model_ref", rerankCfg.Model)
 
 	// Resolve model config - check if it's a reference to a defined model or inline
 	modelCfgVal, err := strategy.ResolveModelConfig(rerankCfg.Model, buildCfg.Models)
 	if err != nil {
-		slog.Error("Failed to resolve reranking model",
+		slog.ErrorContext(ctx, "Failed to resolve reranking model",
 			"model_ref", rerankCfg.Model,
 			"error", err)
 		return nil, fmt.Errorf("failed to resolve reranking model %q: %w", rerankCfg.Model, err)
 	}
 	modelCfg := &modelCfgVal
 
-	slog.Debug("Resolved reranking model config",
+	slog.DebugContext(ctx, "Resolved reranking model config",
 		"provider", modelCfg.Provider,
 		"model", modelCfg.Model)
 
 	// Create provider for reranking model
 	rerankProvider, err := buildCfg.NewProvider(ctx, modelCfg)
 	if err != nil {
-		slog.Error("Failed to create reranking provider",
+		slog.ErrorContext(ctx, "Failed to create reranking provider",
 			"provider", modelCfg.Provider,
 			"model", modelCfg.Model,
 			"error", err)
 		return nil, fmt.Errorf("failed to create reranking provider: %w", err)
 	}
 
-	slog.Debug("Created reranking provider",
+	slog.DebugContext(ctx, "Created reranking provider",
 		"provider_id", rerankProvider.ID())
 
 	// Determine effective TopK:
@@ -202,7 +205,7 @@ func buildRerankingConfig(
 		return nil, fmt.Errorf("failed to create reranker: %w", err)
 	}
 
-	slog.Info("Built reranking configuration successfully",
+	slog.InfoContext(ctx, "Built reranking configuration successfully",
 		"model", rerankCfg.Model,
 		"provider_id", rerankProvider.ID(),
 		"top_k", effectiveTopK,

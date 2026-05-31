@@ -1,16 +1,23 @@
 ---
 title: "Fetch Tool"
-description: "Make HTTP requests to external APIs and web services."
+description: "Read content from HTTP/HTTPS URLs."
 permalink: /tools/fetch/
 ---
 
 # Fetch Tool
 
-_Make HTTP requests to external APIs and web services._
+_Read content from HTTP/HTTPS URLs._
 
 ## Overview
 
-The fetch tool lets agents make HTTP requests (GET, POST, PUT, DELETE, etc.) to external APIs. The agent can read web pages, call REST APIs, download data, and interact with web services.
+The fetch tool lets agents retrieve content from one or more HTTP/HTTPS URLs. It is **read-only** — only `GET` requests are supported. The tool respects `robots.txt`, limits response size (1 MB per URL), and can return content as plain text, Markdown (converted from HTML), or raw HTML.
+
+<div class="callout callout-info" markdown="1">
+<div class="callout-title">GET only
+</div>
+  <p>The fetch tool does <strong>not</strong> support <code>POST</code>, <code>PUT</code>, <code>DELETE</code> or other methods, and does not expose request bodies or per-call custom headers (the toolset can still attach static <a href="#custom-headers">credential headers</a> to every request). To call REST endpoints with other verbs, use the <a href="{{ '/tools/api/' | relative_url }}">API tool</a> or an <a href="{{ '/tools/openapi/' | relative_url }}">OpenAPI toolset</a>.</p>
+
+</div>
 
 ## Configuration
 
@@ -21,9 +28,34 @@ toolsets:
 
 ### Options
 
-| Property  | Type | Default | Description                |
-| --------- | ---- | ------- | -------------------------- |
-| `timeout` | int  | `30`    | Request timeout in seconds |
+| Property            | Type          | Default | Description                                                                                                                                                                                                                                                                                                      |
+| ------------------- | ------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timeout`           | int           | `30`    | Default request timeout in seconds (overridable per tool call).                                                                                                                                                                                                                                                  |
+| `allowed_domains`   | array[string] | _none_  | Allow-list of hosts the tool may fetch. When set, every URL whose host is **not** in the list is rejected before any network call is made. Mutually exclusive with `blocked_domains`.                                                                                                                            |
+| `blocked_domains`   | array[string] | _none_  | Deny-list of hosts the tool must not fetch. URLs whose host matches one of these patterns are rejected before any network call (including `robots.txt`) is made. Mutually exclusive with `allowed_domains`.                                                                                                      |
+| `allow_private_ips` | boolean       | `false` | Opt in to dialling **non-public** IP addresses (loopback, RFC1918, link-local — including the cloud-metadata endpoint at `169.254.169.254` — multicast, and the unspecified address). Required to reach `localhost` / internal services. See [SSRF protection](#ssrf-protection-and-reaching-localhost) below. |
+| `headers`           | map[string]string | _none_ | Static HTTP headers attached to **every** request the toolset issues (including `robots.txt`). Values support `${env.VAR}` for secrets. Caller-supplied entries override the default `User-Agent` and the format-driven `Accept` header. Headers are stripped on cross-host redirects so credentials never leak to a third-party host. See [Custom headers](#custom-headers) below. |
+
+### Domain matching
+
+Domain patterns in `allowed_domains` and `blocked_domains` use the following rules (case-insensitive):
+
+- **Bare domain** — `example.com` matches the host `example.com` _and_ any subdomain such as `docs.example.com`. It does **not** match unrelated hosts that share a suffix (e.g. `badexample.com`).
+- **Leading dot** — `.example.com` matches **only** strict subdomains (`docs.example.com`, `a.b.example.com`), not the apex `example.com`.
+- **Wildcard glob** — `*.example.com` is an alias for the leading-dot form; the apex is excluded. The `*` is only valid as a leading `*.` token (entries like `foo.*`, `*.*.example.com`, or a bare `*` are rejected at config-load time).
+- **IP literal** — IP addresses are matched exactly (`169.254.169.254`).
+- **CIDR range** — `169.254.0.0/16`, `10.0.0.0/8`, `::1/128`, `fc00::/7`. Matches when the URL's host parses as an IP inside the network. Hostname hosts never match a CIDR pattern. Malformed CIDRs are rejected at config-load time.
+- **Trailing dots** in FQDN-form URLs (`http://example.com./`) are stripped before matching, so they cannot bypass a deny-list entry.
+
+The lists are mutually exclusive: a single fetch toolset may set either `allowed_domains` or `blocked_domains`, but not both.
+
+When a list is configured, every redirect target is re-checked against the same list. A request to an allowed origin that redirects to a forbidden host is rejected before any data is read from the redirect.
+
+<div class="callout callout-warning" markdown="1">
+<div class="callout-title">Limitations
+</div>
+  <p>Matching is purely string-based on the URL host. It does <strong>not</strong> perform DNS resolution and does <strong>not</strong> normalise alternative IP encodings (decimal <code>2852039166</code>, hex <code>0xa9.0xfe.0xa9.0xfe</code>, octal, etc. IPv4-mapped IPv6 addresses ARE normalized to their IPv4 form). If you need to deny access to a specific IP, also list its alternative encodings, or block at the network layer.</p>
+</div>
 
 ### Custom Timeout
 
@@ -33,8 +65,101 @@ toolsets:
     timeout: 60
 ```
 
-<div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Fetch vs. API Tool
+### Custom headers
+
+Attach static headers — typically credentials — to every request. Values support `${env.VAR}` interpolation so secrets stay out of YAML, and headers are dropped on cross-host redirects so a redirect chain cannot leak them to a third-party host:
+
+```yaml
+toolsets:
+  - type: fetch
+    allowed_domains:
+      - docs.internal.example.com
+    headers:
+      Authorization: "Bearer ${env.INTERNAL_DOCS_TOKEN}"
+      X-Internal-Client: "docker-agent"
+```
+
+<div class="callout callout-warning" markdown="1">
+<div class="callout-title">Pair credential headers with an allow-list
 </div>
-  <p>The fetch tool gives the agent full control over HTTP requests at runtime. The <a href="{{ '/tools/api/' | relative_url }}">API tool</a> lets you predefine specific API calls as named tools with typed parameters. Use fetch for general-purpose HTTP access; use the API tool for well-known endpoints you want to expose as structured tools.</p>
+  <p>When <code>headers</code> carries credentials (e.g. <code>Authorization</code>), set <code>allowed_domains</code> to the specific hosts that should receive them. Stdlib already strips a small allow-list (<code>Authorization</code>, <code>Cookie</code>, <code>WWW-Authenticate</code>) on cross-domain redirects, and the fetch tool additionally strips every operator-supplied header on cross-host redirects — but an allow-list is the strongest guarantee against accidental exfiltration.</p>
+</div>
+
+### Restrict to specific domains
+
+```yaml
+toolsets:
+  - type: fetch
+    allowed_domains:
+      - docker.com          # docker.com and *.docker.com
+      - github.com          # github.com and *.github.com
+      - .githubusercontent.com  # only subdomains, e.g. raw.githubusercontent.com
+```
+
+### Block sensitive hosts
+
+```yaml
+toolsets:
+  - type: fetch
+    blocked_domains:
+      - 169.254.169.254       # cloud metadata endpoint (literal IP)
+      - 169.254.0.0/16        # entire link-local range (CIDR)
+      - 10.0.0.0/8            # RFC1918 private range
+      - "*.internal.example.com"  # any subdomain (wildcard)
+      - internal.example.com  # internal corporate hostname
+```
+
+<div class="callout callout-info" markdown="1">
+<div class="callout-title">Already blocked by default
+</div>
+  <p>You do <strong>not</strong> need to add loopback, RFC1918, link-local (incl. <code>169.254.169.254</code>), multicast or the unspecified address to <code>blocked_domains</code> to be safe — the fetch tool already refuses connections to those ranges at dial time, after DNS resolution. The example above is only useful if you also want to reject those hosts <em>before</em> any network call (and to surface a clearer error message to the agent), or if you have set <code>allow_private_ips: true</code> and want to deny a specific subset.</p>
+</div>
+
+### SSRF protection and reaching localhost
+
+By default, the fetch tool refuses connections to **non-public IP addresses** — even when DNS for an otherwise-public host resolves to one of them (so DNS rebinding is also blocked). The check happens at dial time, after DNS resolution, and rejects:
+
+- **Loopback** — `127.0.0.0/8`, `::1` (this is what blocks `http://localhost/...` and `http://127.0.0.1/...`)
+- **RFC1918 private ranges** — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- **Link-local** — `169.254.0.0/16` (IPv4, including the cloud-metadata endpoint `169.254.169.254`) and `fe80::/10` (IPv6)
+- **Multicast** and the **unspecified** address (`0.0.0.0`, `::`)
+- **IPv4-mapped IPv6** — addresses like `::ffff:127.0.0.1` or `::ffff:169.254.169.254` are normalized to their IPv4 form and blocked accordingly
+
+This is the default because LLM-driven fetches are a classic Server-Side Request Forgery (SSRF) vector: a prompt-injected URL can otherwise reach internal services, cloud metadata, or admin interfaces on the host running the agent.
+
+If an agent legitimately needs to call **localhost** or an **internal service**, opt in with `allow_private_ips: true`:
+
+```yaml
+toolsets:
+  - type: fetch
+    allow_private_ips: true
+    allowed_domains:
+      - localhost
+      - 127.0.0.1
+      - 10.0.0.0/8            # internal corporate range
+```
+
+<div class="callout callout-warning" markdown="1">
+<div class="callout-title">Pair with an allow-list
+</div>
+  <p>Setting <code>allow_private_ips: true</code> alone re-exposes the SSRF surface. We strongly recommend combining it with an <code>allowed_domains</code> entry that restricts the tool to the specific internal hosts or CIDRs the agent actually needs (e.g. <code>localhost</code>, <code>127.0.0.1</code>, or your internal CIDR).</p>
+  <p><strong>Note:</strong> <code>allowed_domains</code> is checked <em>before</em> DNS resolution (string-based on hostname), while the SSRF check happens <em>after</em> DNS resolution (on the resolved IP). This means <code>allowed_domains</code> and <code>blocked_domains</code> are evaluated independently of <code>allow_private_ips</code> and continue to apply. A public hostname in <code>allowed_domains</code> that resolves to a private IP will still be blocked unless <code>allow_private_ips: true</code> is set.</p>
+</div>
+
+## Tool Interface
+
+The toolset exposes a single tool, `fetch`, with the following parameters:
+
+| Parameter | Type           | Required | Description                                                                                                 |
+| --------- | -------------- | -------- | ----------------------------------------------------------------------------------------------------------- |
+| `urls`    | array[string]  | ✓        | One or more HTTP/HTTPS URLs to fetch (all via `GET`).                                                       |
+| `format`  | string         | ✓        | Output format: `text`, `markdown`, or `html`. HTML responses are converted to text/markdown when requested. |
+| `timeout` | integer        | ✗        | Per-call request timeout in seconds. Overrides the toolset default. Valid range: `1`–`300`.                 |
+
+Responses are capped at **1 MB** per URL. Hosts that disallow the agent's user-agent via `robots.txt` are skipped with a clear error.
+
+<div class="callout callout-tip" markdown="1">
+<div class="callout-title">Fetch vs. API Tool
+</div>
+  <p>Use <code>fetch</code> when the agent needs to read arbitrary public URLs at runtime. Use the <a href="{{ '/tools/api/' | relative_url }}">API tool</a> to expose specific, structured HTTP endpoints (including non-<code>GET</code> verbs) as named tools.</p>
 </div>

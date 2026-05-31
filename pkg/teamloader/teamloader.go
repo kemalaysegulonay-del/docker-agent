@@ -25,7 +25,11 @@ import (
 	"github.com/docker/docker-agent/pkg/skills"
 	"github.com/docker/docker-agent/pkg/team"
 	"github.com/docker/docker-agent/pkg/tools"
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	"github.com/docker/docker-agent/pkg/tools/builtin/deferred"
+	"github.com/docker/docker-agent/pkg/tools/builtin/handoff"
+	"github.com/docker/docker-agent/pkg/tools/builtin/lsp"
+	skillstool "github.com/docker/docker-agent/pkg/tools/builtin/skills"
+	"github.com/docker/docker-agent/pkg/tools/builtin/transfertask"
 	"github.com/docker/docker-agent/pkg/tools/codemode"
 )
 
@@ -34,7 +38,7 @@ var defaultMaxTokens int64 = 32000
 type loadOptions struct {
 	modelOverrides  []string
 	promptFiles     []string
-	toolsetRegistry *ToolsetRegistry
+	toolsetRegistry ToolsetRegistry
 }
 
 type Opt func(*loadOptions) error
@@ -56,7 +60,7 @@ func WithPromptFiles(files []string) Opt {
 }
 
 // WithToolsetRegistry allows using a custom toolset registry instead of the default
-func WithToolsetRegistry(registry *ToolsetRegistry) Opt {
+func WithToolsetRegistry(registry ToolsetRegistry) Opt {
 	return func(opts *loadOptions) error {
 		opts.toolsetRegistry = registry
 		return nil
@@ -103,9 +107,9 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	// Resolve model aliases (e.g., "claude-sonnet-4-5" -> "claude-sonnet-4-5-20250929")
 	// This ensures the API uses the pinned model version. The original name is preserved
 	// in DisplayModel so the sidebar and other UI elements show the user-configured name.
-	modelsStore, err := modelsdev.NewStore()
+	modelsStore, err := runConfig.ModelsDevStore()
 	if err != nil {
-		slog.Debug("Failed to create modelsdev store for alias resolution", "error", err)
+		slog.DebugContext(ctx, "Failed to create modelsdev store for alias resolution", "error", err)
 	} else {
 		config.ResolveModelAliases(ctx, cfg, modelsStore)
 	}
@@ -160,6 +164,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			agent.WithAddDate(agentConfig.AddDate),
 			agent.WithAddEnvironmentInfo(agentConfig.AddEnvironmentInfo),
 			agent.WithAddDescriptionParameter(agentConfig.AddDescriptionParameter),
+			agent.WithRedactSecrets(agentConfig.RedactSecretsEnabled()),
 			agent.WithAddPromptFiles(promptFiles),
 			agent.WithMaxIterations(agentConfig.MaxIterations),
 			agent.WithMaxConsecutiveToolCalls(agentConfig.MaxConsecutiveToolCalls),
@@ -169,36 +174,52 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 			agent.WithHooks(config.MergeHooks(agentConfig.Hooks, cliHooks)),
 		}
 
-		models, err := getModelsForAgent(ctx, cfg, &agentConfig, autoModel, runConfig)
-		if err != nil {
-			// Return auto model fallback errors and DMR not installed errors directly
-			// without wrapping to provide cleaner messages
-			if _, ok := errors.AsType[*config.AutoModelFallbackError](err); ok || errors.Is(err, dmr.ErrNotInstalled) {
+		if agentConfig.Cache != nil && agentConfig.Cache.Enabled {
+			c, err := buildAgentCache(agentConfig.Name, agentConfig.Cache, parentDir)
+			if err != nil {
 				return nil, err
 			}
-			return nil, fmt.Errorf("failed to get models: %w", err)
-		}
-		for _, model := range models {
-			opts = append(opts, agent.WithModel(model))
+			opts = append(opts, agent.WithCache(c))
 		}
 
-		// Load fallback models if configured
-		fallbackModelRefs := agentConfig.GetFallbackModels()
-		if len(fallbackModelRefs) > 0 {
-			fallbackModels, err := getFallbackModelsForAgent(ctx, cfg, &agentConfig, runConfig)
+		if agentConfig.Harness != nil {
+			harnessCfg := *agentConfig.Harness
+			if harnessCfg.Model == "" {
+				harnessCfg.Model = agentConfig.Model
+			}
+			opts = append(opts, agent.WithHarness(&harnessCfg))
+		} else {
+			models, err := getModelsForAgent(ctx, cfg, &agentConfig, autoModel, runConfig)
 			if err != nil {
-				return nil, fmt.Errorf("failed to get fallback models: %w", err)
+				// Return auto model fallback errors and DMR not installed errors directly
+				// without wrapping to provide cleaner messages
+				if _, ok := errors.AsType[*config.AutoModelFallbackError](err); ok || errors.Is(err, dmr.ErrNotInstalled) {
+					return nil, err
+				}
+				return nil, fmt.Errorf("failed to get models: %w", err)
 			}
-			for _, model := range fallbackModels {
-				opts = append(opts, agent.WithFallbackModel(model))
+			for _, model := range models {
+				opts = append(opts, agent.WithModel(model))
 			}
-			opts = append(opts,
-				agent.WithFallbackRetries(agentConfig.GetFallbackRetries()),
-				agent.WithFallbackCooldown(agentConfig.GetFallbackCooldown()),
-			)
+
+			// Load fallback models if configured
+			fallbackModelRefs := agentConfig.GetFallbackModels()
+			if len(fallbackModelRefs) > 0 {
+				fallbackModels, err := getFallbackModelsForAgent(ctx, cfg, &agentConfig, runConfig)
+				if err != nil {
+					return nil, fmt.Errorf("failed to get fallback models: %w", err)
+				}
+				for _, model := range fallbackModels {
+					opts = append(opts, agent.WithFallbackModel(model))
+				}
+				opts = append(opts,
+					agent.WithFallbackRetries(agentConfig.GetFallbackRetries()),
+					agent.WithFallbackCooldown(agentConfig.GetFallbackCooldown()),
+				)
+			}
 		}
 
-		agentTools, warnings := getToolsForAgent(ctx, &agentConfig, parentDir, runConfig, loadOpts.toolsetRegistry, configName)
+		agentTools, warnings := getToolsForAgent(ctx, &agentConfig, parentDir, runConfig, loadOpts.toolsetRegistry, configName, expander)
 		if len(warnings) > 0 {
 			opts = append(opts, agent.WithLoadTimeWarnings(warnings))
 		}
@@ -206,14 +227,15 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 		// Add skills toolset if skills are enabled
 		if agentConfig.Skills.Enabled() {
 			loadedSkills := skills.Load(agentConfig.Skills.Sources)
+			loadedSkills = filterSkillsByName(loadedSkills, agentConfig.Skills.Include)
 			if len(loadedSkills) > 0 {
-				agentTools = append(agentTools, builtin.NewSkillsToolset(loadedSkills, runConfig.WorkingDir))
+				agentTools = append(agentTools, skillstool.New(loadedSkills, runConfig.WorkingDir))
 			}
 		}
 
 		opts = append(opts, agent.WithToolSets(agentTools...))
 
-		ag := agent.New(agentConfig.Name, agentConfig.Instruction, opts...)
+		ag := agent.New(agentConfig.Name, expander.Expand(ctx, agentConfig.Instruction, nil), opts...)
 		agents = append(agents, ag)
 		agentsByName[agentConfig.Name] = ag
 	}
@@ -253,7 +275,7 @@ func LoadWithConfig(ctx context.Context, agentSource config.Source, runConfig *c
 	// Build agent default models map
 	agentDefaultModels := make(map[string]string)
 	for _, agent := range cfg.Agents {
-		if agent.Model != "" {
+		if agent.Harness == nil && agent.Model != "" {
 			agentDefaultModels[agent.Name] = agent.Model
 		}
 	}
@@ -273,7 +295,7 @@ func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentC
 	var models []provider.Provider
 
 	// Obtain the singleton store once, outside the loop.
-	modelsStore, modelsStoreErr := modelsdev.NewStore()
+	modelsStore, modelsStoreErr := runConfig.ModelsDevStore()
 
 	for name := range strings.SplitSeq(a.Model, ",") {
 		modelCfg, exists := cfg.Models[name]
@@ -293,7 +315,7 @@ func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentC
 		if modelCfg.MaxTokens != nil {
 			maxTokens = modelCfg.MaxTokens
 		} else if modelsStoreErr == nil {
-			m, err := modelsStore.GetModel(ctx, modelCfg.Provider+"/"+modelCfg.Model)
+			m, err := modelsStore.GetModel(ctx, modelsdev.NewID(modelCfg.Provider, modelCfg.Model))
 			if err == nil {
 				maxTokens = &m.Limit.Output
 			}
@@ -306,6 +328,9 @@ func getModelsForAgent(ctx context.Context, cfg *latest.Config, a *latest.AgentC
 		}
 		if maxTokens != nil {
 			opts = append(opts, options.WithMaxTokens(*maxTokens))
+		}
+		if modelsStoreErr == nil {
+			opts = append(opts, options.WithModelsDevStore(modelsStore))
 		}
 
 		// Pass the full models map for routing rules to resolve model references
@@ -334,7 +359,7 @@ func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *lates
 	var fallbackModels []provider.Provider
 
 	// Obtain the singleton store once, outside the loop.
-	modelsStore, modelsStoreErr := modelsdev.NewStore()
+	modelsStore, modelsStoreErr := runConfig.ModelsDevStore()
 
 	for _, name := range a.GetFallbackModels() {
 		modelCfg, exists := cfg.Models[name]
@@ -353,7 +378,7 @@ func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *lates
 		if modelCfg.MaxTokens != nil {
 			maxTokens = modelCfg.MaxTokens
 		} else if modelsStoreErr == nil {
-			m, err := modelsStore.GetModel(ctx, modelCfg.Provider+"/"+modelCfg.Model)
+			m, err := modelsStore.GetModel(ctx, modelsdev.NewID(modelCfg.Provider, modelCfg.Model))
 			if err == nil {
 				maxTokens = &m.Limit.Output
 			}
@@ -366,6 +391,9 @@ func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *lates
 		}
 		if maxTokens != nil {
 			opts = append(opts, options.WithMaxTokens(*maxTokens))
+		}
+		if modelsStoreErr == nil {
+			opts = append(opts, options.WithModelsDevStore(modelsStore))
 		}
 
 		// Pass the full models map for routing rules to resolve model references
@@ -384,15 +412,17 @@ func getFallbackModelsForAgent(ctx context.Context, cfg *latest.Config, a *lates
 	return fallbackModels, nil
 }
 
-// getToolsForAgent returns the tool definitions for an agent based on its configuration
-func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir string, runConfig *config.RuntimeConfig, registry *ToolsetRegistry, configName string) ([]tools.ToolSet, []string) {
+// getToolsForAgent returns the tool definitions for an agent based on its
+// configuration. Toolset instructions support ${...} JavaScript placeholders
+// (e.g. ${env.X}); they are expanded here using the runtime env provider.
+func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir string, runConfig *config.RuntimeConfig, registry ToolsetRegistry, configName string, expander *js.Expander) ([]tools.ToolSet, []string) {
 	var (
 		toolSets    []tools.ToolSet
 		warnings    []string
-		lspBackends []builtin.LSPBackend
+		lspBackends []lsp.Backend
 	)
 
-	deferredToolset := builtin.NewDeferredToolset()
+	deferredToolset := deferred.New()
 
 	for i := range a.Toolsets {
 		toolset := a.Toolsets[i]
@@ -400,13 +430,13 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 		tool, err := registry.CreateTool(ctx, toolset, parentDir, runConfig, configName)
 		if err != nil {
 			// Collect error but continue loading other toolsets
-			slog.Warn("Toolset configuration failed; skipping", "type", toolset.Type, "ref", toolset.Ref, "command", toolset.Command, "error", err)
+			slog.WarnContext(ctx, "Toolset configuration failed; skipping", "type", toolset.Type, "ref", toolset.Ref, "command", toolset.Command, "error", err)
 			warnings = append(warnings, fmt.Sprintf("toolset %s failed: %v", toolset.Type, err))
 			continue
 		}
 
 		wrapped := WithToolsFilter(tool, toolset.Tools...)
-		wrapped = WithInstructions(wrapped, toolset.Instruction)
+		wrapped = WithInstructions(wrapped, expander.Expand(ctx, toolset.Instruction, nil))
 		wrapped = WithToon(wrapped, toolset.Toon)
 		wrapped = WithModelOverride(wrapped, toolset.Model)
 
@@ -424,13 +454,13 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 
 		// Collect LSP backends for multiplexing when there are multiple.
 		// Instead of adding them individually (which causes duplicate tool names),
-		// they are combined into a single LSPMultiplexer after the loop.
+		// they are combined into a single Multiplexer after the loop.
 		if toolset.Type == "lsp" {
-			if lspTool, ok := tool.(*builtin.LSPTool); ok {
-				lspBackends = append(lspBackends, builtin.LSPBackend{LSP: lspTool, Toolset: wrapped})
+			if lspTool, ok := tool.(*lsp.ToolSet); ok {
+				lspBackends = append(lspBackends, lsp.Backend{LSP: lspTool, Toolset: wrapped})
 				continue
 			}
-			slog.Warn("Toolset configured as type 'lsp' but registry returned unexpected type; treating as regular toolset",
+			slog.WarnContext(ctx, "Toolset configured as type 'lsp' but registry returned unexpected type; treating as regular toolset",
 				"type", fmt.Sprintf("%T", tool), "command", toolset.Command)
 		}
 
@@ -440,7 +470,7 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 	// Merge LSP backends: if there are multiple, combine them into a single
 	// multiplexer so the LLM sees one set of lsp_* tools instead of duplicates.
 	if len(lspBackends) > 1 {
-		toolSets = append(toolSets, builtin.NewLSPMultiplexer(lspBackends))
+		toolSets = append(toolSets, lsp.NewLSPMultiplexer(lspBackends))
 	} else if len(lspBackends) == 1 {
 		toolSets = append(toolSets, lspBackends[0].Toolset)
 	}
@@ -450,10 +480,10 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 	}
 
 	if len(a.SubAgents) > 0 {
-		toolSets = append(toolSets, builtin.NewTransferTaskTool())
+		toolSets = append(toolSets, transfertask.New())
 	}
 	if len(a.Handoffs) > 0 {
-		toolSets = append(toolSets, builtin.NewHandoffTool())
+		toolSets = append(toolSets, handoff.New())
 	}
 
 	// Wrap all tools in a single Code Mode toolset.
@@ -464,6 +494,34 @@ func getToolsForAgent(ctx context.Context, a *latest.AgentConfig, parentDir stri
 	}
 
 	return toolSets, warnings
+}
+
+// filterSkillsByName returns the subset of skills whose Name matches one of
+// the include filters. When include is empty, skills is returned unchanged.
+// Skills are not reordered; each matching skill keeps its original position.
+// Any include entry that does not match any loaded skill is logged as a warning.
+func filterSkillsByName(loaded []skills.Skill, include []string) []skills.Skill {
+	if len(include) == 0 {
+		return loaded
+	}
+	wanted := make(map[string]bool, len(include))
+	for _, name := range include {
+		wanted[name] = true
+	}
+	matched := make(map[string]bool, len(wanted))
+	filtered := make([]skills.Skill, 0, len(loaded))
+	for _, s := range loaded {
+		if wanted[s.Name] {
+			filtered = append(filtered, s)
+			matched[s.Name] = true
+		}
+	}
+	for _, name := range include {
+		if !matched[name] {
+			slog.Warn("Skill filter does not match any loaded skill", "name", name)
+		}
+	}
+	return filtered
 }
 
 // configNameFromSource extracts a clean config name from a source name.
@@ -530,7 +588,10 @@ func resolveAgentRefs(
 		}
 
 		// Rename the external agent so it doesn't collide with locally-defined
-		// agents (external agents typically have the name "root").
+		// agents. External agents resolve to their team's default agent (one
+		// explicitly named "root" if it exists, otherwise the first agent
+		// declared), which we may want to expose under a different name in
+		// the importing team.
 		agent.WithName(agentName)(a)
 
 		*agents = append(*agents, a)

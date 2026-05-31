@@ -58,31 +58,6 @@ func NewBaseWithCollapsed(msg *types.Message, sessionState service.SessionStateR
 	}
 }
 
-// Message returns the tool message.
-func (b *Base) Message() *types.Message {
-	return b.message
-}
-
-// SessionState returns the session state reader.
-func (b *Base) SessionState() service.SessionStateReader {
-	return b.sessionState
-}
-
-// Width returns the current width.
-func (b *Base) Width() int {
-	return b.width
-}
-
-// Height returns the current height.
-func (b *Base) Height() int {
-	return b.height
-}
-
-// Spinner returns the spinner.
-func (b *Base) Spinner() spinner.Spinner {
-	return b.spinner
-}
-
 func (b *Base) SetSize(width, height int) tea.Cmd {
 	b.width = width
 	b.height = height
@@ -127,6 +102,11 @@ func (b *Base) View() string {
 	return b.render(b.message, b.spinner, b.sessionState, b.width, b.height)
 }
 
+// ExpandedView returns the regular, full tool renderer.
+func (b *Base) ExpandedView() string {
+	return b.View()
+}
+
 // CollapsedView returns a simplified view for use in collapsed reasoning blocks.
 // Falls back to the regular View() if no collapsed renderer is provided.
 func (b *Base) CollapsedView() string {
@@ -148,6 +128,13 @@ func (b *Base) StopAnimation() {
 func (b *Base) isSpinnerActive() bool {
 	return b.message.ToolStatus == types.ToolStatusPending ||
 		b.message.ToolStatus == types.ToolStatusRunning
+}
+
+// NoArgsRenderer is a Renderer that displays only the tool name and status,
+// without arguments or a result. Useful for tools whose arguments aren't
+// worth surfacing in the UI (e.g. user_prompt, todo helpers).
+func NoArgsRenderer(msg *types.Message, s spinner.Spinner, sessionState service.SessionStateReader, width, _ int) string {
+	return RenderTool(msg, s, "", "", width, sessionState.HideToolResults())
 }
 
 // SimpleRenderer creates a renderer that extracts a single string argument

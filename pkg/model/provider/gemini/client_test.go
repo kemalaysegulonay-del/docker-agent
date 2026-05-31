@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -362,10 +363,10 @@ func TestConvertMessagesToGemini_ThoughtSignature(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			contents := convertMessagesToGemini([]chat.Message{
+			contents := convertMessagesToGemini(t.Context(), []chat.Message{
 				{Role: chat.MessageRoleUser, Content: "go"},
 				tt.message,
-			})
+			}, modelsdev.ID{}, modelsdev.NewDatabaseStore(&modelsdev.Database{}))
 
 			require.Len(t, contents, 2)
 			assistant := contents[1]

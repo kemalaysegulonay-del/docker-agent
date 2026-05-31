@@ -25,19 +25,22 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.3"
           cache: true
 
       - name: Lint
         uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
-          version: v2.9
+          version: v2.12.2
 
       - name: Lint GitHub Actions
         uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8 # v2.1.2
         with:
           fail-on-error: true
           pyflakes: false
+
+      - name: Lint GitHub Workflows
+        run: ./scripts/workflow-lint.sh
 
   build-and-test:
     runs-on: ubuntu-latest
@@ -48,22 +51,22 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.3"
           cache: true
 
-      - name: Install mise
-        uses: jdx/mise-action@c37c93293d6b742fc901e1406b8f764f6fb19dac # v2.4.4
+      - name: Install Task
+        run: go install github.com/go-task/task/v3/cmd/task@latest
 
       - name: Create bin directory
         run: mkdir -p "$HOME/bin"
 
       - name: Build
-        run: mise build
+        run: task build
 
       - name: Run tests
         run: |
-          mise test
-          mise test-binary
+          task test
+          task test-binary
 
   license-check:
     runs-on: ubuntu-latest
@@ -74,14 +77,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.3"
           cache: true
 
       - name: Install go-licences
         run: go install github.com/google/go-licenses@latest
 
       - name: Check licenses
-        run: go-licenses check . --allowed_licenses=Apache-2.0,MIT,BSD-3-Clause,BSD-2-Clause --ignore modernc.org/mathutil
+        run: go-licenses check . --allowed_licenses=Apache-2.0,MIT,BSD-3-Clause,BSD-2-Clause --ignore modernc.org/mathutil --ignore github.com/hashicorp/hcl/v2
 
   build-image:
     if: github.event_name == 'pull_request'
@@ -100,14 +103,15 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: false
           sbom: false
+          provenance: false
           build-args: |
             GIT_TAG=pr
             GIT_COMMIT=dev
           cache-from: type=gha,scope=buildx
-          cache-to: type=gha,mode=max,scope=buildx
+          cache-to: type=gha,mode=min,scope=buildx
 
   build-and-push-image:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && !github.event.repository.fork
     needs: [lint, build-and-test, license-check]
     runs-on: ubuntu-latest
     steps:

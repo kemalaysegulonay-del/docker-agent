@@ -1,16 +1,16 @@
 ---
 title: "Quick Start"
-description: "Get up and running with docker-agent in under 5 minutes. Pick whichever path suits you best."
+description: "Get up and running with Docker Agent in under 5 minutes. Pick whichever path suits you best."
 permalink: /getting-started/quickstart/
 ---
 
 # Quick Start
 
-_Get up and running with docker-agent in under 5 minutes. Pick whichever path suits you best._
+_Get up and running with Docker Agent in under 5 minutes. Pick whichever path suits you best._
 
 ## Option A: Run the Default Agent
 
-The fastest way to try docker-agent — no config file needed:
+The fastest way to try Docker Agent — no config file needed:
 
 ```bash
 # Launch the default agent with the interactive TUI
@@ -40,7 +40,7 @@ Use the `docker agent new` command to scaffold a config file through prompts:
 $ docker agent new
 
 # Or specify options directly
-$ docker agent new --model openai/gpt-4o
+$ docker agent new --model openai/gpt-5-mini
 
 # Override iteration limits
 $ docker agent new --model dmr/ai/gemma3-qat:12B --max-iterations 15
@@ -59,7 +59,7 @@ Create an `agent.yaml` by hand for full control. Here's a minimal example:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: A helpful coding assistant
     instruction: |
       You are an expert software developer. Help users write
@@ -72,7 +72,7 @@ agents:
 
 This gives your agent:
 
-- **Claude Sonnet 4** as the underlying model
+- **Claude Sonnet 4.5** as the underlying model
 - **Filesystem access** to read and write files
 - **Shell access** to run commands
 - **Think tool** for step-by-step reasoning
@@ -81,6 +81,13 @@ This gives your agent:
 # Launch the interactive terminal UI
 $ docker agent run agent.yaml
 ```
+
+<div class="callout callout-tip" markdown="1">
+<div class="callout-title">Prefer HCL?
+</div>
+  <p>You can write the same config as <code>agent.hcl</code> using labeled blocks and heredocs. See <a href="{{ '/configuration/hcl/' | relative_url }}">HCL Configuration</a>.</p>
+
+</div>
 
 ## Try It Out
 
@@ -91,7 +98,7 @@ Once your agent is running, try asking it to:
 - _"Explain what the code in main.go does"_
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Add <code>--yolo</code> to auto-approve all tool calls: `docker agent run agent.yaml --yolo`</p>
 
@@ -116,7 +123,7 @@ Give your agent persistent memory and web search:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Research assistant with memory
     instruction: |
       You are a research assistant. Search the web for information,
@@ -130,7 +137,7 @@ agents:
 ```
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Docker MCP Tools
+<div class="callout-title">Docker MCP Tools
 </div>
   <p>The <code>ref: docker:duckduckgo</code> syntax runs the DuckDuckGo MCP server in a Docker container. This is the recommended way to use MCP tools — secure, isolated, and easy to configure. Requires Docker Desktop.</p>
 
@@ -152,7 +159,7 @@ agents:
   <a class="card" href="{{ '/configuration/overview/' | relative_url }}">
     <div class="card-icon">📚</div>
     <h3>Configuration Reference</h3>
-    <p>Full reference for all YAML options.</p>
+    <p>Full reference for all YAML and HCL options.</p>
   </a>
   <a class="card" href="{{ '/community/troubleshooting/' | relative_url }}">
     <div class="card-icon">🔧</div>

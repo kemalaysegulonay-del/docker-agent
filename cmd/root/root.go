@@ -160,6 +160,7 @@ We collect anonymous usage data to help improve docker agent. To disable:
 		newModelsCmd(),
 		newDebugCmd(),
 		newAliasCmd(),
+		newSandboxCmd(),
 		newServeCmd(),
 	)
 
@@ -265,13 +266,13 @@ func isFirstRun() bool {
 	markerFile := filepath.Join(configDir, ".cagent_first_run")
 
 	// Ensure the config directory exists before trying to create the marker file
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
 		slog.Warn("Failed to create config directory for first run marker", "error", err)
 		return false
 	}
 
 	// Atomically create the marker file. If it already exists, OpenFile returns an error.
-	f, err := os.OpenFile(markerFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644)
+	f, err := os.OpenFile(markerFile, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // empty marker file with no sensitive content
 	if err != nil {
 		return false // File already exists or other error, not first run
 	}

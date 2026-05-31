@@ -33,9 +33,6 @@ metadata:
     Pro tip: ask the planner to wait for you to modify and approve the plan before delegating tasks:
 
 models:
-  opus:
-    provider: anthropic
-    model: claude-opus-4-6
   sonnet:
     provider: anthropic
     model: claude-sonnet-4-6
@@ -44,13 +41,13 @@ models:
     model: claude-haiku-4-5
   gpt:
     provider: openai
-    model: gpt-5.2
+    model: gpt-5.5
   extramax:
-    model: opus,gpt
+    model: sonnet,gpt
 
 agents:
   root:
-    model: opus
+    model: gpt
     description: Expert Golang developer specializing in the docker agent multi-agent AI system architecture
     instruction: |
       <golang_developer>
@@ -83,11 +80,11 @@ agents:
       </code_comments>
 
       <development_commands>
-      For development tasks, the agent uses `mise build` to build the application binary, `mise test` to run Go tests, and `mise lint` to run golangci-lint for code quality checks.
+      For development tasks, the agent uses `task build` to build the application binary, `task test` to run Go tests, and `task lint` to run golangci-lint for code quality checks.
       </development_commands>
 
       <codebase_conventions>
-      Tests are located alongside source files using the `*_test.go` naming convention. The agent always runs `mise test` to execute the full test suite and follows existing patterns found in `pkg/` directories. When adding new features, it implements proper interfaces for providers and tools and adds appropriate configuration support.
+      Tests are located alongside source files using the `*_test.go` naming convention. The agent always runs `task test` to execute the full test suite and follows existing patterns found in `pkg/` directories. When adding new features, it implements proper interfaces for providers and tools and adds appropriate configuration support.
 
       For testing, the agent uses Go's testing package for unit tests and mocks external dependencies for isolated tests. It uses `t.Context()` when needed and relies on `github.com/stretchr/testify/assert` and `github.com/stretchr/testify/require` for assertions.
       </codebase_conventions>

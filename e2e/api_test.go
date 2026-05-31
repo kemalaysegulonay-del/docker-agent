@@ -47,7 +47,9 @@ func TestCagentAPI_ListSessions(t *testing.T) {
 				},
 			}
 
-			resp, err := client.Get("http://localhost/api/sessions")
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "http://localhost/api/sessions", http.NoBody)
+			require.NoError(t, err)
+			resp, err := client.Do(req)
 			require.NoError(t, err)
 			defer resp.Body.Close()
 
@@ -86,7 +88,7 @@ func startCagentAPI(t *testing.T, db string) string {
 	sessionStore, err := session.NewSQLiteSessionStore(dbCopy)
 	require.NoError(t, err)
 
-	srv, err := server.New(t.Context(), sessionStore, &config.RuntimeConfig{}, 0, nil)
+	srv, err := server.New(t.Context(), sessionStore, &config.RuntimeConfig{}, 0, nil, "")
 	require.NoError(t, err)
 
 	go func() {

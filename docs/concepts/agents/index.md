@@ -12,7 +12,7 @@ _Agents are the core building blocks of docker-agent. Each agent is an AI-powere
 
 An agent in docker-agent is defined by:
 
-- **Model** — The AI model powering it (e.g., Claude, GPT-4o, Gemini). See [Models]({{ '/concepts/models/' | relative_url }}).
+- **Model** — The AI model powering it (e.g., Claude, GPT-5, Gemini). See [Models]({{ '/concepts/models/' | relative_url }}).
 - **Description** — A brief summary of what the agent does (used by other agents for delegation)
 - **Instruction** — The system prompt that defines the agent's behavior and personality
 - **Tools** — Capabilities like filesystem access, shell commands, or external APIs
@@ -21,7 +21,7 @@ An agent in docker-agent is defined by:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Expert software developer
     instruction: |
       You are an expert developer. Write clean, efficient code
@@ -37,7 +37,7 @@ agents:
 Every docker-agent configuration has a **root agent** — the entry point that receives user messages. In a single-agent setup, this is the only agent. In a multi-agent setup, the root agent acts as a coordinator, delegating tasks to specialized sub-agents.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Naming
+<div class="callout-title">Naming
 </div>
   <p>The first agent defined in your YAML (or the one named <code>root</code>) is the root agent by default. You can also specify which agent to start with using <code>docker agent run config.yaml -a agent_name</code>.</p>
 
@@ -47,7 +47,7 @@ Every docker-agent configuration has a **root agent** — the entry point that r
 
 | Property               | Type    | Required | Description                                                    |
 | ---------------------- | ------- | -------- | -------------------------------------------------------------- |
-| `model`                | string  | ✓        | Model reference (inline like `openai/gpt-4o` or a named model) |
+| `model`                | string  | ✓        | Model reference (inline like `openai/gpt-5-mini` or a named model) |
 | `description`          | string  | ✓        | What the agent does — used by other agents for delegation      |
 | `instruction`          | string  | ✓        | System prompt defining behavior                                |
 | `toolsets`             | array   | ✗        | List of tool configurations                                    |
@@ -57,7 +57,7 @@ Every docker-agent configuration has a **root agent** — the entry point that r
 | `add_environment_info` | boolean | ✗        | Include OS, working directory, git info in context             |
 | `max_iterations`       | int     | ✗        | Max tool-calling loops (default: unlimited)                    |
 | `commands`             | object  | ✗        | Named prompts callable via `/command`                          |
-| `skills`               | boolean | ✗        | Enable skill discovery and loading                             |
+| `skills`               | boolean \| list | ✗    | Enable skill discovery and loading. `true` = `["local"]`; list values may combine `"local"` with remote skill-server URLs. |
 
 ## Model Fallbacks
 
@@ -66,10 +66,10 @@ Agents can automatically fail over to alternative models when the primary model 
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     fallback:
       models:
-        - openai/gpt-4o
+        - openai/gpt-5-mini
         - google/gemini-2.5-flash
       retries: 2 # retries per model for 5xx errors
       cooldown: 1m # stick with fallback after 429
@@ -82,7 +82,7 @@ Define reusable prompts that can be invoked as commands:
 ```yaml
 agents:
   root:
-    model: openai/gpt-4o
+    model: openai/gpt-5-mini
     instruction: You are a helpful assistant.
     commands:
       df: "Check how much free space I have on my disk"
@@ -111,7 +111,7 @@ $ docker agent run  # now runs your custom agent
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 See also
+<div class="callout-title">See also
 </div>
   <p>For reusable task-specific instructions, see <a href="{{ '/features/skills/' | relative_url }}">Skills</a>. For multi-agent patterns, see <a href="{{ '/concepts/multi-agent/' | relative_url }}">Multi-Agent</a>. For full config reference, see <a href="{{ '/configuration/agents/' | relative_url }}">Agent Config</a>.</p>
 

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/docker/docker-agent/pkg/cli"
 	"github.com/docker/docker-agent/pkg/config"
+	pathx "github.com/docker/docker-agent/pkg/path"
 	"github.com/docker/docker-agent/pkg/server"
 	"github.com/docker/docker-agent/pkg/session"
 	"github.com/docker/docker-agent/pkg/telemetry"
@@ -22,6 +24,7 @@ type apiFlags struct {
 	pullIntervalMins int
 	fakeResponses    string
 	recordPath       string
+	authToken        string
 	runConfig        config.RuntimeConfig
 }
 
@@ -40,6 +43,7 @@ func newAPICmd() *cobra.Command {
 	cmd.PersistentFlags().IntVar(&flags.pullIntervalMins, "pull-interval", 0, "Auto-pull OCI reference every N minutes (0 = disabled)")
 	cmd.PersistentFlags().StringVar(&flags.fakeResponses, "fake", "", "Replay AI responses from cassette file (for testing)")
 	cmd.PersistentFlags().StringVar(&flags.recordPath, "record", "", "Record AI API interactions to cassette file")
+	cmd.PersistentFlags().StringVar(&flags.authToken, "auth-token", "", "Bearer token required for API requests (empty = no authentication)")
 	cmd.MarkFlagsMutuallyExclusive("fake", "record")
 	addRuntimeConfigFlags(cmd, &flags.runConfig)
 
@@ -66,7 +70,7 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr 
 	}
 	defer func() {
 		if err := cleanup(); err != nil {
-			slog.Error("Failed to cleanup fake proxy", "error", err)
+			slog.ErrorContext(ctx, "Failed to cleanup fake proxy", "error", err)
 		}
 	}()
 
@@ -77,12 +81,12 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr 
 	}
 	defer func() {
 		if err := recordCleanup(); err != nil {
-			slog.Error("Failed to cleanup recording proxy", "error", err)
+			slog.ErrorContext(ctx, "Failed to cleanup recording proxy", "error", err)
 		}
 	}()
 
-	if f.pullIntervalMins > 0 && !config.IsOCIReference(agentsPath) {
-		return errors.New("--pull-interval flag can only be used with OCI references, not local files")
+	if f.pullIntervalMins > 0 && !config.IsOCIReference(agentsPath) && !config.IsURLReference(agentsPath) {
+		return errors.New("--pull-interval flag can only be used with OCI or URL references, not local files")
 	}
 
 	ln, lnCleanup, err := newListener(ctx, f.listenAddr)
@@ -92,11 +96,12 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr 
 	defer lnCleanup()
 
 	out.Println("Listening on", ln.Addr().String())
+	warnIfNotLoopback(out, ln.Addr())
 
-	slog.Debug("Starting server", "agents", agentsPath, "addr", ln.Addr().String())
+	slog.DebugContext(ctx, "Starting server", "agents", agentsPath, "addr", ln.Addr().String())
 
 	// Expand tilde in session database path
-	sessionDB, err := expandTilde(f.sessionDB)
+	sessionDB, err := pathx.ExpandHomeDir(f.sessionDB)
 	if err != nil {
 		return err
 	}
@@ -107,7 +112,7 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr 
 	}
 	defer func() {
 		if err := sessionStore.Close(); err != nil {
-			slog.Error("Failed to close session store", "error", err)
+			slog.ErrorContext(ctx, "Failed to close session store", "error", err)
 		}
 	}()
 
@@ -116,10 +121,29 @@ func (f *apiFlags) runAPICommand(cmd *cobra.Command, args []string) (commandErr 
 		return fmt.Errorf("resolving agent sources: %w", err)
 	}
 
-	s, err := server.New(ctx, sessionStore, &f.runConfig, time.Duration(f.pullIntervalMins)*time.Minute, sources)
+	s, err := server.New(ctx, sessionStore, &f.runConfig, time.Duration(f.pullIntervalMins)*time.Minute, sources, f.authToken)
 	if err != nil {
 		return fmt.Errorf("creating server: %w", err)
 	}
 
 	return s.Serve(ctx, ln)
+}
+
+// warnIfNotLoopback prints a security warning when the API server is bound to
+// an address other than loopback. The default --listen value is 127.0.0.1, so
+// reaching this code path means the operator was explicit about exposing the
+// API; we just remind them that the API has no authentication.
+func warnIfNotLoopback(out *cli.Printer, addr net.Addr) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		// Unix sockets and named pipes rely on filesystem permissions.
+		return
+	}
+	if tcpAddr.IP.IsLoopback() {
+		return
+	}
+	out.Println("WARNING: API server is listening on a non-loopback address.")
+	out.Println("         The API has no authentication; anyone able to reach")
+	out.Println("         this address can run agents and access all sessions.")
+	slog.Warn("API server bound to non-loopback address", "addr", tcpAddr.String())
 }

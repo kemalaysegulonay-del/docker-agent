@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"time"
@@ -52,19 +53,19 @@ type Client struct {
 	base.Config
 
 	client     openai.Client
-	baseURL    string
 	httpClient *http.Client
+	engine     string
 }
 
 // NewClient creates a new DMR client from the provided configuration
 func NewClient(ctx context.Context, cfg *latest.ModelConfig, opts ...options.Opt) (*Client, error) {
 	if cfg == nil {
-		slog.Error("DMR client creation failed", "error", "model configuration is required")
+		slog.ErrorContext(ctx, "DMR client creation failed", "error", "model configuration is required")
 		return nil, errors.New("model configuration is required")
 	}
 
 	if cfg.Provider != "dmr" {
-		slog.Error("DMR client creation failed", "error", "model type must be 'dmr'", "actual_type", cfg.Provider)
+		slog.ErrorContext(ctx, "DMR client creation failed", "error", "model type must be 'dmr'", "actual_type", cfg.Provider)
 		return nil, errors.New("model type must be 'dmr'")
 	}
 
@@ -81,14 +82,14 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, opts ...options.Opt
 		endpoint, engine, err = getDockerModelEndpointAndEngine(ctx)
 		if err != nil {
 			if err.Error() == "unknown flag: --json\n\nUsage:  docker [OPTIONS] COMMAND [ARG...]\n\nRun 'docker --help' for more information" {
-				slog.Debug("docker model status query failed", "error", err)
+				slog.DebugContext(ctx, "docker model status query failed", "error", err)
 				return nil, ErrNotInstalled
 			}
-			slog.Error("docker model status query failed", "error", err)
+			slog.ErrorContext(ctx, "docker model status query failed", "error", err)
 		} else {
 			// Auto-pull the model if needed
 			if err := pullDockerModelIfNeeded(ctx, cfg.Model); err != nil {
-				slog.Debug("docker model pull failed", "error", err)
+				slog.DebugContext(ctx, "docker model pull failed", "error", err)
 				return nil, err
 			}
 		}
@@ -103,54 +104,65 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, opts ...options.Opt
 
 	clientOptions = append(clientOptions, option.WithBaseURL(baseURL), option.WithAPIKey("")) // DMR doesn't need auth
 
-	// Build runtime flags from ModelConfig and engine
-	contextSize, providerRuntimeFlags, specOpts := parseDMRProviderOpts(cfg)
-	configFlags := buildRuntimeFlagsFromModelConfig(engine, cfg)
-	finalFlags, warnings := mergeRuntimeFlagsPreferUser(configFlags, providerRuntimeFlags)
-	for _, w := range warnings {
-		slog.Warn(w)
+	parsed, err := parseDMRProviderOpts(engine, cfg)
+	if err != nil {
+		slog.ErrorContext(ctx, "DMR provider_opts invalid", "error", err, "model", cfg.Model)
+		return nil, err
 	}
-	slog.Debug("DMR provider_opts parsed", "model", cfg.Model, "context_size", contextSize, "runtime_flags", finalFlags, "speculative_opts", specOpts, "engine", engine)
+	backendCfg := buildConfigureBackendConfig(parsed.contextSize, parsed.runtimeFlags, parsed.specOpts, parsed.llamaCpp, parsed.vllm, parsed.keepAlive)
+	slog.DebugContext(ctx, "DMR provider_opts parsed",
+		"model", cfg.Model,
+		"engine", engine,
+		"context_size", derefInt64(parsed.contextSize),
+		"runtime_flags", parsed.runtimeFlags,
+		"raw_runtime_flags", parsed.rawRuntimeFlags,
+		"mode", derefString(parsed.mode),
+		"keep_alive", derefString(parsed.keepAlive),
+		"speculative_opts", parsed.specOpts,
+		"llamacpp", parsed.llamaCpp,
+		"vllm", parsed.vllm,
+	)
 	// Skip model configuration when generating titles to avoid reconfiguring the model
 	// with different settings (e.g., smaller max_tokens) that would affect the main agent.
 	if !globalOptions.GeneratingTitle() {
-		if err := configureModel(ctx, httpClient, baseURL, cfg.Model, contextSize, finalFlags, specOpts); err != nil {
-			slog.Debug("model configure via API skipped or failed", "error", err)
+		if err := configureModel(ctx, httpClient, baseURL, cfg.Model, backendCfg, parsed.mode, parsed.rawRuntimeFlags); err != nil {
+			slog.DebugContext(ctx, "model configure via API skipped or failed", "error", err)
 		}
 	}
 
-	slog.Debug("DMR client created successfully", "model", cfg.Model, "base_url", baseURL)
+	slog.DebugContext(ctx, "DMR client created successfully", "model", cfg.Model, "base_url", baseURL)
 
 	return &Client{
 		Config: base.Config{
 			ModelConfig:  *cfg,
 			ModelOptions: globalOptions,
+			BaseURL:      baseURL,
 		},
 		client:     openai.NewClient(clientOptions...),
-		baseURL:    baseURL,
 		httpClient: httpClient,
+		engine:     engine,
 	}, nil
 }
 
 // convertMessages converts chat messages to OpenAI format and merges consecutive
 // system/user messages, which is needed by some local models run by DMR.
-func convertMessages(messages []chat.Message) []openai.ChatCompletionMessageParamUnion {
-	openaiMessages := oaistream.ConvertMessages(messages)
+func (c *Client) convertMessages(ctx context.Context, messages []chat.Message) []openai.ChatCompletionMessageParamUnion {
+	openaiMessages := oaistream.ConvertMessages(ctx, messages, c.ID(), c.ModelOptions.ModelsDevStore())
 	return oaistream.MergeConsecutiveMessages(openaiMessages)
 }
 
 // CreateChatCompletionStream creates a streaming chat completion request
 // It returns a stream that can be iterated over to get completion chunks
 func (c *Client) CreateChatCompletionStream(ctx context.Context, messages []chat.Message, requestTools []tools.Tool) (chat.MessageStream, error) {
-	slog.Debug("Creating DMR chat completion stream",
+	slog.DebugContext(ctx, "Creating DMR chat completion stream",
 		"model", c.ModelConfig.Model,
 		"message_count", len(messages),
 		"tool_count", len(requestTools),
-		"base_url", c.baseURL,
+		"base_url", c.BaseURL,
 	)
 
 	if len(messages) == 0 {
-		slog.Error("DMR stream creation failed", "error", "at least one message is required")
+		slog.ErrorContext(ctx, "DMR stream creation failed", "error", "at least one message is required")
 		return nil, errors.New("at least one message is required")
 	}
 
@@ -158,7 +170,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, messages []chat
 
 	params := openai.ChatCompletionNewParams{
 		Model:    c.ModelConfig.Model,
-		Messages: convertMessages(messages),
+		Messages: c.convertMessages(ctx, messages),
 		StreamOptions: openai.ChatCompletionStreamOptionsParam{
 			IncludeUsage: openai.Bool(trackUsage),
 		},
@@ -179,22 +191,22 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, messages []chat
 
 	if c.ModelConfig.MaxTokens != nil {
 		params.MaxTokens = openai.Int(*c.ModelConfig.MaxTokens)
-		slog.Debug("DMR request configured with max tokens", "max_tokens", *c.ModelConfig.MaxTokens)
+		slog.DebugContext(ctx, "DMR request configured with max tokens", "max_tokens", *c.ModelConfig.MaxTokens)
 	}
 
 	if len(requestTools) > 0 {
-		slog.Debug("Adding tools to DMR request", "tool_count", len(requestTools))
+		slog.DebugContext(ctx, "Adding tools to DMR request", "tool_count", len(requestTools))
 		toolsParam := make([]openai.ChatCompletionToolUnionParam, len(requestTools))
 		for i, tool := range requestTools {
 			parameters, err := ConvertParametersToSchema(tool.Parameters)
 			if err != nil {
-				slog.Error("Failed to convert tool parameters to DMR schema", "error", err, "tool", tool.Name)
+				slog.ErrorContext(ctx, "Failed to convert tool parameters to DMR schema", "error", err, "tool", tool.Name)
 				return nil, fmt.Errorf("failed to convert tool parameters to DMR schema for tool %s: %w", tool.Name, err)
 			}
 
 			paramsMap, ok := parameters.(map[string]any)
 			if !ok {
-				slog.Error("Converted parameters is not a map", "tool", tool.Name)
+				slog.ErrorContext(ctx, "Converted parameters is not a map", "tool", tool.Name)
 				return nil, fmt.Errorf("converted parameters is not a map for tool %s", tool.Name)
 			}
 
@@ -214,15 +226,52 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, messages []chat
 		}
 	}
 
+	// Collect per-request extra JSON fields. SetExtraFields replaces the map
+	// wholesale, so merge all contributors before a single Set call.
+	extraFields := map[string]any{}
+
+	// NoThinking: disable reasoning at the chat-template level. llama.cpp and
+	// vLLM both honor chat_template_kwargs.enable_thinking=false for Qwen3 /
+	// Hermes / DeepSeek-R1 style templates; other engines ignore unknown keys.
+	//
+	// When the caller has also set a small MaxTokens (e.g. session title
+	// generation sets max_tokens=20), raise it to noThinkingMinOutputTokens
+	// so any residual reasoning tokens the engine/template still emits can't
+	// starve the visible output. The nil-guard is intentional: if MaxTokens
+	// is unset the caller has imposed no cap, so there is nothing to floor
+	// and we leave max_tokens off the request (letting the engine use its
+	// own output budget). Mirrors the OpenAI provider (see
+	// pkg/model/provider/openai/client.go).
+	if c.ModelOptions.NoThinking() {
+		extraFields["chat_template_kwargs"] = map[string]any{"enable_thinking": false}
+		if c.ModelConfig.MaxTokens != nil && *c.ModelConfig.MaxTokens < noThinkingMinOutputTokens {
+			params.MaxTokens = openai.Int(noThinkingMinOutputTokens)
+			slog.DebugContext(ctx, "DMR NoThinking: bumped max_tokens floor",
+				"from", *c.ModelConfig.MaxTokens, "to", noThinkingMinOutputTokens)
+		}
+	}
+
+	// vLLM-specific per-request fields (e.g. thinking_token_budget).
+	if c.engine == engineVLLM {
+		if fields := buildVLLMRequestFields(&c.ModelConfig); fields != nil {
+			maps.Copy(extraFields, fields)
+		}
+	}
+
+	if len(extraFields) > 0 {
+		params.SetExtraFields(extraFields)
+		slog.DebugContext(ctx, "DMR extra request fields applied", "fields", extraFields)
+	}
+
 	// Log the request in JSON format for debugging
 	if requestJSON, err := json.Marshal(params); err == nil {
-		slog.Debug("DMR chat completion request", "request", string(requestJSON))
+		slog.DebugContext(ctx, "DMR chat completion request", "request", string(requestJSON))
 	} else {
-		slog.Error("Failed to marshal DMR request to JSON", "error", err)
+		slog.ErrorContext(ctx, "Failed to marshal DMR request to JSON", "error", err)
 	}
 
 	if structuredOutput := c.ModelOptions.StructuredOutput(); structuredOutput != nil {
-		slog.Debug("Adding structured output to DMR request", "structured_output", structuredOutput)
+		slog.DebugContext(ctx, "Adding structured output to DMR request", "name", structuredOutput.Name, "strict", structuredOutput.Strict)
 
 		params.ResponseFormat.OfJSONSchema = &openai.ResponseFormatJSONSchemaParam{
 			JSONSchema: openai.ResponseFormatJSONSchemaJSONSchemaParam{
@@ -236,7 +285,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, messages []chat
 
 	stream := c.client.Chat.Completions.NewStreaming(ctx, params)
 
-	slog.Debug("DMR chat completion stream created successfully", "model", c.ModelConfig.Model, "base_url", c.baseURL)
+	slog.DebugContext(ctx, "DMR chat completion stream created successfully", "model", c.ModelConfig.Model, "base_url", c.BaseURL)
 	return newStreamAdapter(stream, trackUsage), nil
 }
 

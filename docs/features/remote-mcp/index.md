@@ -21,7 +21,7 @@ toolsets:
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 OAuth flow
+<div class="callout-title">OAuth flow
 </div>
   <p>When you connect to a remote MCP server that requires OAuth, docker-agent opens your browser automatically for authentication. Tokens are cached for subsequent sessions.</p>
 
@@ -37,9 +37,113 @@ toolsets:
       transport_type: "sse" # or "streamable"
       headers:
         Authorization: "Bearer token" # optional: static auth
+    # Optional: use only for trusted internal/private MCP or OAuth endpoints.
+    allow_private_ips: true
 ```
 
 For full configuration details, see the [Tool Config]({{ '/configuration/tools/' | relative_url }}) page.
+
+Set `allow_private_ips: true` on a remote MCP toolset only when the MCP server or its OAuth registration/token endpoints intentionally resolve to private, loopback, or link-local addresses. The default blocks those OAuth helper requests to reduce SSRF risk.
+
+### OAuth for servers without Dynamic Client Registration
+
+Most remote MCP servers that require OAuth support [Dynamic Client Registration (RFC 7591)]({{ 'https://datatracker.ietf.org/doc/html/rfc7591' }}) — no configuration is needed, docker-agent handles the flow for you.
+
+For servers that do **not** support DCR, provide explicit OAuth credentials with the `oauth:` block:
+
+```yaml
+toolsets:
+  - type: mcp
+    remote:
+      url: "https://mcp.example.com/mcp"
+      transport_type: "streamable"
+      oauth:
+        clientId: "my-app-client-id"
+        clientSecret: "my-app-client-secret" # optional (public clients may omit)
+        callbackPort: 8765                   # optional; picks a free port otherwise
+        scopes:                              # optional; server-specific
+          - read
+          - write
+```
+
+| Field          | Type            | Required | Description                                                                                      |
+| -------------- | --------------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `clientId`     | string          | ✓        | OAuth client ID registered with the remote MCP server.                                           |
+| `clientSecret` | string          | ✗        | OAuth client secret. Omit for public clients using PKCE.                                         |
+| `callbackPort` | integer         | ✗        | Local port to receive the OAuth redirect. If omitted, docker-agent picks a random free port.    |
+| `scopes`       | array[string]   | ✗        | Scopes to request during the authorization step. Values are server-specific.                     |
+| `callbackRedirectURL` | string   | ✗        | Custom OAuth redirect URI. Useful when the auth server requires HTTPS or a pre-registered URL. The literal placeholder `${callbackPort}` is replaced with the actual local callback port. See below.            |
+
+Secrets should be stored in a credential helper or environment variable rather than committed — see [Secrets]({{ '/guides/secrets/' | relative_url }}) for interpolation patterns.
+
+### Custom redirect URI (`callbackRedirectURL`)
+
+Some authorization servers require the OAuth `redirect_uri` to be HTTPS or to match a URL that was pre-registered during app creation — neither of which plays nicely with a locally-bound loopback address such as `http://127.0.0.1:8765/callback`.
+
+To work around this, set `callbackRedirectURL` to a public URL that redirects back to the local callback server. The literal placeholder `${callbackPort}` is substituted with the actual port the local callback server is listening on (either `callbackPort` when set, or the randomly-assigned port otherwise).
+
+```yaml
+toolsets:
+  - type: mcp
+    remote:
+      url: "https://mcp.example.com/mcp"
+      transport_type: "streamable"
+      oauth:
+        clientId: "my-app-client-id"
+        callbackPort: 8765
+        # Advertise this URL to the authorization server. The external
+        # service at redirect.example.com is expected to 302-redirect the
+        # browser to http://127.0.0.1:8765/callback preserving the query
+        # string (code, state, …).
+        callbackRedirectURL: "https://redirect.example.com/cb?port=${callbackPort}"
+```
+
+The local callback server still listens on the loopback interface on `callbackPort`; only the `redirect_uri` advertised to the authorization server changes.
+
+**Validation rules:**
+
+- The URL must be absolute (scheme + host) once `${callbackPort}` has been substituted.
+- Only `http` and `https` schemes are accepted.
+- `http` is only allowed when the host is a loopback address (`127.0.0.1`, `::1`, `localhost`); any other host must use `https` to avoid exposing the authorization `code` on the wire (RFC 8252 §7.3).
+
+### Unmanaged OAuth flow (server mode)
+
+When running `docker-agent serve api` (no local browser, no callback server), the runtime delegates the OAuth dance to the connected client via an MCP elicitation. There are two sub-behaviors, selected by the `--mcp-oauth-redirect-uri` flag:
+
+- **`--mcp-oauth-redirect-uri=<URL>` set** (recommended for hosts like Docker Desktop): the runtime generates `state` + PKCE + (optional) Dynamic Client Registration in-process, builds the full authorize URL, and emits an elicitation whose `Meta` includes:
+
+  | Key                          | Value                                                            |
+  | ---------------------------- | ---------------------------------------------------------------- |
+  | `docker-agent/type`                | `"oauth_flow"`                                                   |
+  | `docker-agent/server_url`          | The MCP server URL (for display / favicon)                       |
+  | `docker-agent/authorize_url`       | The full URL the client should open in the user's browser        |
+  | `docker-agent/state`               | The `state` value the client must echo back when replying        |
+  | `auth_server`                | Issuer of the authorization server                               |
+  | `auth_server_metadata`       | RFC 8414 authorization-server metadata document                  |
+  | `resource_metadata`          | RFC 9728 protected-resource metadata document                    |
+
+  The client opens the browser at the URL provided in the `docker-agent/authorize_url` meta field, receives the OAuth callback at whatever endpoint the configured `redirect_uri` resolves to (typically a host-controlled bouncer that 302s into a deeplink), and replies to the elicitation with `accept` and `Content = {"code": "...", "state": "..."}`. The runtime verifies the `state`, exchanges the `code` at the token endpoint (using the same `redirect_uri` for RFC 6749 §4.1.3 binding), stores the token, and replays the original MCP request with `Authorization: Bearer ...`.
+
+- **Flag not set** (client-driven): the runtime emits the elicitation meta below and expects the client to drive the OAuth flow itself (PKCE, DCR, token exchange) and reply with `Content = {"access_token": "...", "refresh_token": "...", ...}`:
+
+  | Key                          | Value                                                            |
+  | ---------------------------- | ---------------------------------------------------------------- |
+  | `docker-agent/type`          | `"oauth_flow"`                                                   |
+  | `docker-agent/server_url`    | The MCP server URL (for display / favicon)                       |
+  | `auth_server`                | Issuer of the authorization server                               |
+  | `auth_server_metadata`       | RFC 8414 authorization-server metadata document                  |
+  | `resource_metadata`          | RFC 9728 protected-resource metadata document                    |
+
+The client-driven `{access_token, ...}` reply shape is still accepted on the `--mcp-oauth-redirect-uri` path too: a client that prefers to do the exchange itself can ignore the `docker-agent/authorize_url`/`docker-agent/state` keys.
+
+A per-toolset `callbackRedirectURL` (in the YAML) overrides the runtime-wide `--mcp-oauth-redirect-uri` for that toolset.
+
+<div class="callout callout-warning" markdown="1">
+<div class="callout-title">Security note
+</div>
+  <p>The <code>POST /api/mcp-oauth/callback</code> route is open by default (no auth required) when <code>--auth-token</code> is unset. State values are 128-bit opaque tokens, so brute-force is infeasible, but a state value that leaks (e.g. via debug logs or a compromised host) could be exploited by an attacker to inject a code. Set <code>--auth-token</code> when <code>docker agent serve api</code> listens on a network-reachable interface. When set, <code>--auth-token</code> enforces Bearer-token authentication on all API routes including this callback endpoint.</p>
+
+</div>
 
 ## Project Management &amp; Collaboration
 
@@ -127,7 +231,7 @@ Combine multiple remote MCP servers in a single agent:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     instruction: |
       You help manage projects and deployments.
     toolsets:
@@ -149,7 +253,7 @@ agents:
 ```
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Growing list
+<div class="callout-title">Growing list
 </div>
   <p>This list is updated as more services add MCP support. If a service you use isn't listed, check their documentation — many providers are adding MCP endpoints regularly.</p>
 

@@ -3,7 +3,8 @@ package editfile
 import (
 	"fmt"
 
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/tools/builtin/filesystem"
 	"github.com/docker/docker-agent/pkg/tui/components/spinner"
 	"github.com/docker/docker-agent/pkg/tui/components/toolcommon"
 	"github.com/docker/docker-agent/pkg/tui/core/layout"
@@ -31,7 +32,7 @@ func render(
 	_ int,
 ) string {
 	// Parse tool arguments to extract the file path for display.
-	args, err := builtin.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
+	args, err := filesystem.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
 	if err != nil {
 		// If arguments cannot be parsed, fail silently to avoid breaking the TUI.
 		return ""
@@ -72,7 +73,7 @@ func render(
 			"%s%s %s",
 			toolcommon.Icon(msg, s),
 			styles.ToolName.Render(msg.ToolDefinition.DisplayName()),
-			styles.ToolMessageStyle.Render(toolcommon.ShortenPath(args.Path)),
+			styles.ToolMessageStyle.Render(pathx.ShortenHome(args.Path)),
 		)
 	}
 
@@ -110,7 +111,7 @@ func renderCollapsed(
 	width,
 	_ int,
 ) string {
-	args, err := builtin.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
+	args, err := filesystem.ParseEditFileArgs([]byte(msg.ToolCall.Function.Arguments))
 	if err != nil {
 		return ""
 	}
@@ -142,7 +143,7 @@ func renderCollapsed(
 		"%s%s %s%s",
 		toolcommon.Icon(msg, s),
 		styles.ToolName.Render(msg.ToolDefinition.DisplayName()),
-		styles.ToolMessageStyle.Render(toolcommon.ShortenPath(args.Path)),
+		styles.ToolMessageStyle.Render(pathx.ShortenHome(args.Path)),
 		diffSummary,
 	)
 

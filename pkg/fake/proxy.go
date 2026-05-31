@@ -107,7 +107,7 @@ func StartStreamingRecordingProxy(
 		case err := <-stopDone:
 			return err
 		case <-ctx.Done():
-			slog.Warn("Recording proxy cleanup timed out, cassette may be incomplete")
+			slog.WarnContext(ctx, "Recording proxy cleanup timed out, cassette may be incomplete")
 			return nil
 		}
 	}
@@ -192,7 +192,7 @@ func StartProxyWithOptions(
 		case err := <-stopDone:
 			return err
 		case <-ctx.Done():
-			slog.Warn("Recording proxy cleanup timed out, cassette may be incomplete")
+			slog.WarnContext(ctx, "Recording proxy cleanup timed out, cassette may be incomplete")
 			return nil
 		}
 	}
@@ -220,6 +220,11 @@ func DefaultMatcher(onError func(err error)) recorder.MatcherFunc {
 	thinkingConfigRegex := regexp.MustCompile(`"thinkingConfig":\{[^}]*\},?`)
 	// Normalize OpenAI reasoning config (varies based on NoThinking flag and thinking budget).
 	reasoningRegex := regexp.MustCompile(`"reasoning":\{[^}]*\},?`)
+	// Normalize OpenAI tool_choice field. The string form ("auto", "none",
+	// "required") is now sent explicitly whenever tools are present so that
+	// strict gateways (LiteLLM) accept the request, but older cassettes were
+	// recorded without it.
+	toolChoiceRegex := regexp.MustCompile(`"tool_choice":"[^"]*",?`)
 
 	return func(r *http.Request, i cassette.Request) bool {
 		if r.Body == nil || r.Body == http.NoBody {
@@ -249,10 +254,12 @@ func DefaultMatcher(onError func(err error)) recorder.MatcherFunc {
 		normalizedReq = maxTokensRegex.ReplaceAllString(normalizedReq, "")
 		normalizedReq = thinkingConfigRegex.ReplaceAllString(normalizedReq, "")
 		normalizedReq = reasoningRegex.ReplaceAllString(normalizedReq, "")
+		normalizedReq = toolChoiceRegex.ReplaceAllString(normalizedReq, "")
 		normalizedCassette := callIDRegex.ReplaceAllString(i.Body, "call_ID")
 		normalizedCassette = maxTokensRegex.ReplaceAllString(normalizedCassette, "")
 		normalizedCassette = thinkingConfigRegex.ReplaceAllString(normalizedCassette, "")
 		normalizedCassette = reasoningRegex.ReplaceAllString(normalizedCassette, "")
+		normalizedCassette = toolChoiceRegex.ReplaceAllString(normalizedCassette, "")
 
 		return normalizedReq == normalizedCassette
 	}
@@ -321,7 +328,7 @@ func Handle(transport http.RoundTripper, headerUpdater func(host string, req *ht
 
 		resp, err := client.Do(req)
 		if err != nil {
-			slog.Error("VCR proxy request failed", "url", targetURL, "error", err)
+			slog.ErrorContext(ctx, "VCR proxy request failed", "url", targetURL, "error", err)
 			return echo.NewHTTPError(http.StatusInternalServerError, "Failed to run request: "+err.Error())
 		}
 		defer resp.Body.Close()

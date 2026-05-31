@@ -13,7 +13,7 @@ _Measure agent quality with automated evaluations — tool call accuracy, respon
 The `docker agent eval` command runs your agent against a set of recorded sessions and scores the results. Each eval session captures a user question, the expected tool calls, and criteria the response must satisfy. docker-agent replays the question, compares the agent's behavior to expectations, and produces a report.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Docker required
+<div class="callout-title">Docker required
 </div>
   <p>Evaluations run inside Docker containers for isolation. Each eval gets a clean environment with optional setup scripts. Docker Desktop (or Docker Engine) must be running.</p>
 
@@ -129,7 +129,7 @@ The `evals` object inside each session controls what gets scored:
 
 ## Scoring Metrics
 
-docker-agent evaluates agents across four dimensions:
+docker-agent evaluates agents across three dimensions:
 
 | Metric              | How It's Measured                                                                                                         |
 | ------------------- | ------------------------------------------------------------------------------------------------------------------------- |
@@ -147,7 +147,7 @@ The easiest way to create eval sessions is from real conversations:
 4. Edit the generated JSON to add `evals` criteria (relevance, size, etc.)
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Start with tool call scoring (automatic from recorded sessions), then add relevance criteria for the responses you care most about.</p>
 
@@ -162,7 +162,7 @@ $ docker agent eval <agent-file>|<registry-ref> [<eval-dir>|./evals]
 | Flag                | Default                     | Description                                                       |
 | ------------------- | --------------------------- | ----------------------------------------------------------------- |
 | `-c, --concurrency` | num CPUs                    | Number of concurrent evaluation runs                              |
-| `--judge-model`     | `anthropic/claude-opus-4-5` | Model for LLM-as-a-judge relevance scoring                        |
+| `--judge-model`     | `anthropic/claude-opus-4-5-20251101` | Model for LLM-as-a-judge relevance scoring                        |
 | `--output`          | `&lt;eval-dir&gt;/results`  | Directory for results, logs, and session databases                |
 | `--only`            | (all)                       | Only run evals with file names matching these patterns            |
 | `--base-image`      | (default)                   | Custom base Docker image for eval containers                      |
@@ -181,7 +181,7 @@ After a run completes, docker-agent produces:
 - **Log file** — Debug-level log of the entire evaluation run
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Debugging Failed Evals
+<div class="callout-title">Debugging Failed Evals
 </div>
   <p>Use <code>--keep-containers</code> to preserve containers after evaluation. You can then inspect them with <code>docker exec</code> to understand why an eval failed. The session database (<code>.db</code> file) contains the full conversation history for each eval.</p>
 
@@ -195,10 +195,11 @@ $ docker agent eval demo.yaml ./evals
   ✓ Checking the Content of README.md File
     ✓ tool calls  ✓ relevance 1/1
 
-Summary: 2/2 passed
-  Sizes:      0/0
-  Tool Calls: avg F1 1.00 (2 evals)
-  Relevance:  3/3
+✅     Tool Calls: 100.0% avg F1 (2 evals)
+✅      Relevance: 3/3 passed (100.0%)
+
+Total Cost: $0.012345
+Total Time: 12s
 
 Sessions DB: ./evals/results/happy-panda-1234.db
 Sessions JSON: ./evals/results/happy-panda-1234-sessions.json
@@ -230,7 +231,7 @@ $ docker agent eval agent.yaml ./evals
 ```
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ See also
+<div class="callout-title">See also
 </div>
   <p>Use <code>/eval</code> in the <a href="{{ '/features/tui/' | relative_url }}">TUI</a> to create eval sessions from conversations. See the <a href="{{ '/features/cli/' | relative_url }}">CLI Reference</a> for all <code>docker agent eval</code> flags. Example eval configs are in <a href="https://github.com/docker/docker-agent/tree/main/examples/eval">examples/eval</a> on GitHub.</p>
 

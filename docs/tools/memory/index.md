@@ -12,7 +12,7 @@ _Persistent key-value storage backed by SQLite for cross-session recall._
 
 The memory tool provides persistent key-value storage backed by SQLite. Data survives across sessions, allowing agents to remember facts, user preferences, project context, and past decisions. Memories can be organized with categories and searched by keyword.
 
-Each agent gets its own database at `~/.cagent/memory/<agent-name>/memory.db` by default.
+By default, the database is stored at `~/.cagent/memory/<config-name>/memory.db`, where `<config-name>` is derived from the loaded configuration (typically the YAML file name) and falls back to `default` when unavailable. Agents declared in the same configuration share this database by default; set an explicit `path` per toolset to isolate them.
 
 ## Available Tools
 
@@ -35,7 +35,7 @@ toolsets:
 
 | Property | Type   | Default                                   | Description                      |
 | -------- | ------ | ----------------------------------------- | -------------------------------- |
-| `path`   | string | `~/.cagent/memory/<agent-name>/memory.db` | Path to the SQLite database file |
+| `path`   | string | `~/.cagent/memory/<config-name>/memory.db` | Path to the SQLite database file |
 
 ### Custom Database Path
 
@@ -55,7 +55,7 @@ Memories support an optional `category` field for organization and filtering. Co
 - `decision` — Past decisions and their rationale
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Memory is especially useful for long-running assistants that need to recall information across conversations — like coding preferences, project conventions, or context discovered during previous sessions.</p>
 </div>

@@ -1,20 +1,22 @@
 ---
 title: "Configuration Overview"
-description: "docker-agent uses YAML configuration files to define agents, models, tools, and their relationships."
+description: "docker-agent uses YAML or HCL configuration files to define agents, models, tools, and their relationships."
 permalink: /configuration/overview/
 ---
 
 # Configuration Overview
 
-_docker-agent uses YAML configuration files to define agents, models, tools, and their relationships._
+_docker-agent uses YAML or HCL configuration files to define agents, models, tools, and their relationships._
 
 ## File Structure
 
-A docker-agent YAML config has these main sections:
+A docker-agent config can be written in YAML or HCL. The examples on this page use YAML; see [HCL Configuration]({{ '/configuration/hcl/' | relative_url }}) for the block-based HCL syntax.
+
+A docker-agent config has these main sections:
 
 ```bash
 # 1. Version — configuration schema version (optional but recommended)
-version: 6
+version: 8
 
 # 2. Metadata — optional agent metadata for distribution
 metadata:
@@ -26,7 +28,7 @@ metadata:
 models:
   claude:
     provider: anthropic
-    model: claude-sonnet-4-0
+    model: claude-sonnet-4-5
     max_tokens: 64000
 
 # 4. Agents — define AI agents with their behavior
@@ -44,16 +46,23 @@ rag:
     docs: ["./docs"]
     strategies:
       - type: chunked-embeddings
-        model: openai/text-embedding-3-small
+        embedding_model: openai/text-embedding-3-small
 
-# 6. Providers — optional reusable provider definitions
+# 6. MCPs — reusable MCP server definitions (optional)
+mcps:
+  github:
+    remote:
+      url: https://api.githubcopilot.com/mcp
+      transport_type: sse
+
+# 7. Providers — optional reusable provider definitions
 providers:
   my_provider:
     provider: anthropic  # or openai (default), google, amazon-bedrock, etc.
     token_key: MY_API_KEY
     max_tokens: 16384
 
-# 7. Permissions — agent-level tool permission rules (optional)
+# 8. Permissions — agent-level tool permission rules (optional)
 #    For user-wide global permissions, see ~/.config/cagent/config.yaml
 permissions:
   allow: ["read_*"]
@@ -67,9 +76,19 @@ The simplest possible configuration — a single agent with an inline model:
 ```yaml
 agents:
   root:
-    model: openai/gpt-4o
+    model: openai/gpt-5-mini
     description: A helpful assistant
     instruction: You are a helpful assistant.
+```
+
+The same config in HCL:
+
+```hcl
+agent "root" {
+  model       = "openai/gpt-5-mini"
+  description = "A helpful assistant"
+  instruction = "You are a helpful assistant."
+}
 ```
 
 ## Inline vs Named Models
@@ -80,7 +99,7 @@ Models can be referenced inline or defined in the `models` section:
   <div class="card" style="cursor:default;">
     <h3>Inline</h3>
     <p>Quick and simple. Use <code>provider/model</code> syntax directly.</p>
-    <pre style="margin-top:12px"><code class="language-yaml">model: openai/gpt-4o</code></pre>
+    <pre style="margin-top:12px"><code class="language-yaml">model: openai/gpt-5-mini</code></pre>
   </div>
   <div class="card" style="cursor:default;">
     <h3>Named</h3>
@@ -92,6 +111,11 @@ Models can be referenced inline or defined in the `models` section:
 ## Config Sections
 
 <div class="cards">
+  <a class="card" href="{{ '/configuration/hcl/' | relative_url }}">
+    <div class="card-icon">🧱</div>
+    <h3>HCL Configuration</h3>
+    <p>Write the same agent schema in HCL using labeled blocks, heredocs, and block-based tool definitions.</p>
+  </a>
   <a class="card" href="{{ '/configuration/agents/' | relative_url }}">
     <div class="card-icon">🤖</div>
     <h3>Agent Config</h3>
@@ -138,14 +162,19 @@ Models can be referenced inline or defined in the `models` section:
 
 API keys and secrets are read from environment variables — never stored in config files. See [Managing Secrets]({{ '/guides/secrets/' | relative_url }}) for all the ways to provide credentials (env files, Docker Compose secrets, macOS Keychain, `pass`):
 
-| Variable            | Provider      |
-| ------------------- | ------------- |
-| `OPENAI_API_KEY`    | OpenAI        |
-| `ANTHROPIC_API_KEY` | Anthropic     |
-| `GOOGLE_API_KEY`    | Google Gemini |
-| `MISTRAL_API_KEY`   | Mistral       |
-| `XAI_API_KEY`       | xAI           |
-| `NEBIUS_API_KEY`    | Nebius        |
+| Variable                   | Provider                                            |
+| -------------------------- | --------------------------------------------------- |
+| `OPENAI_API_KEY`           | OpenAI                                              |
+| `ANTHROPIC_API_KEY`        | Anthropic                                           |
+| `GOOGLE_API_KEY` / `GEMINI_API_KEY` | Google Gemini                              |
+| `MISTRAL_API_KEY`          | Mistral                                             |
+| `XAI_API_KEY`              | xAI                                                 |
+| `NEBIUS_API_KEY`           | Nebius                                              |
+| `MINIMAX_API_KEY`          | MiniMax                                             |
+| `REQUESTY_API_KEY`         | Requesty                                            |
+| `GITHUB_TOKEN`             | GitHub Copilot (PAT with `copilot` scope)           |
+| `AZURE_API_KEY`            | Azure OpenAI (override with `token_key`)            |
+| `AWS_BEARER_TOKEN_BEDROCK` | AWS Bedrock (or the standard AWS credentials chain) |
 
 **Tool Auto-Installation:**
 
@@ -154,12 +183,98 @@ API keys and secrets are read from environment variables — never stored in con
 | `DOCKER_AGENT_AUTO_INSTALL` | Set to `false` to disable automatic tool installation           |
 | `DOCKER_AGENT_TOOLS_DIR`    | Override the base directory for installed tools (default: `~/.cagent/tools/`) |
 
-<div class="callout callout-warning" markdown="1">
-<div class="callout-title">⚠️ Important
+**Runtime overrides:**
+
+| Variable                            | Description                                                                                          |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `DOCKER_AGENT_DEFAULT_MODEL`        | Default model used when none is specified, in `provider/model` form (e.g. `openai/gpt-5-mini`).      |
+| `DOCKER_AGENT_MODELS_GATEWAY`       | Route model traffic through a gateway. Equivalent to the `--models-gateway` flag.                    |
+| `DOCKER_AGENT_HIDE_TELEMETRY_BANNER`| Set to `1` to suppress the first-run telemetry notice.                                               |
+
+<div class="callout callout-info" markdown="1">
+<div class="callout-title">Legacy <code>CAGENT_*</code> aliases
 </div>
-  <p>Model references are case-sensitive: <code>openai/gpt-4o</code> is not the same as <code>openai/GPT-4o</code>.</p>
+  <p>The same variables are also accepted with the legacy <code>CAGENT_</code> prefix (e.g. <code>CAGENT_DEFAULT_MODEL</code>, <code>CAGENT_MODELS_GATEWAY</code>, <code>CAGENT_HIDE_TELEMETRY_BANNER</code>) for backward compatibility. Prefer the <code>DOCKER_AGENT_*</code> form in new setups.</p>
 
 </div>
+
+<div class="callout callout-warning" markdown="1">
+<div class="callout-title">Important
+</div>
+  <p>Model references are case-sensitive: <code>openai/gpt-5-mini</code> is not the same as <code>openai/GPT-5-mini</code>.</p>
+
+</div>
+
+## Variable Expansion in Config Fields
+
+docker-agent uses **two different expansion syntaxes** depending on the field. They are not interchangeable: using the wrong syntax in a field is currently a silent no-op, so the literal string is passed through. Tracking issue: [#2615](https://github.com/docker/docker-agent/issues/2615).
+
+### JavaScript template literals — `${env.VAR}`
+
+Used wherever the agent prompt or HTTP traffic is templated. Backed by a JS evaluator, so you also get `||` defaults, ternaries, and tool calls (`${tool({...})}`).
+
+Applies to:
+
+- `agents.<name>.description`
+- `agents.<name>.welcome_message`
+- `agents.<name>.instruction`
+- `agents.<name>.commands.*` (string form and `instruction:` field)
+- `toolsets[*].instruction`
+- `toolsets[*].headers` and `toolsets[*].remote.headers` (MCP, A2A, OpenAPI, fetch, API)
+
+For `api` toolsets, `api_config.endpoint` and `api_config.headers` are also rendered through the JS expander (the same syntax applies).
+
+```yaml
+agents:
+  root:
+    description: "Assistant for ${env.USER || 'guest'}"
+    commands:
+      deploy: "Deploy ${env.PROJECT_NAME || 'app'} to ${env.ENV || 'staging'}"
+    toolsets:
+      - type: openapi
+        url: https://api.example.com
+        headers:
+          Authorization: "Bearer ${env.INTERNAL_TOKEN}"
+```
+
+Undefined variables expand to the empty string.
+
+### Shell-style — `$VAR`, `${VAR}`, `~`
+
+Used only for filesystem paths. Backed by `os.ExpandEnv` plus tilde expansion against the current user's home directory.
+
+Applies to:
+
+- `agents.<name>.toolsets[*].working_dir` (MCP, LSP)
+- `agents.<name>.toolsets[*].path` (memory, tasks)
+- `agents.<name>.toolsets[*].env` values (MCP, shell, script, LSP) — these go through `os.Expand`, not the JS evaluator, so `${env.X}` is **not** recognized here either.
+- The `~` prefix is also accepted in any path-like field documented as such.
+
+```yaml
+agents:
+  root:
+    toolsets:
+      - type: memory
+        path: "~/notes/${PROJECT}/memory.db"
+      - type: mcp
+        command: my-server
+        working_dir: "$HOME/work"
+```
+
+The `${env.VAR}` form is **not** recognized in these path fields today.
+
+### Quick reference
+
+| Field                                         | `${env.X}` | `$X` / `${X}` | `~` |
+| --------------------------------------------- | :--------: | :-----------: | :-: |
+| `description`, `welcome_message`              |     ✓      |       ✗       |  ✗  |
+| `instruction` (agent and toolset)             |     ✓      |       ✗       |  ✗  |
+| `commands.*`                                  |     ✓      |       ✗       |  ✗  |
+| `headers`, `remote.headers`, `api_config.headers` |     ✓      |       ✗       |  ✗  |
+| `working_dir`, `path`                         |     ✗      |       ✓       |  ✓  |
+| `env` values                                  |     ✗      |       ✓       |  ✗  |
+
+When in doubt, prefer `${env.X}` for prompts and headers, and `${X}` (or `$X`) for paths.
 
 ## Validation
 
@@ -173,7 +288,7 @@ docker-agent validates your configuration at startup:
 
 ## JSON Schema
 
-For editor autocompletion and validation, use the [Docker Agent JSON Schema](https://github.com/docker/docker-agent/blob/main/agent-schema.json). Add this to the top of your YAML file:
+For YAML editor autocompletion and validation, use the [Docker Agent JSON Schema](https://github.com/docker/docker-agent/blob/main/agent-schema.json). Add this to the top of your YAML file:
 
 ```bash
 # yaml-language-server: $schema=https://raw.githubusercontent.com/docker/docker-agent/main/agent-schema.json
@@ -181,14 +296,14 @@ For editor autocompletion and validation, use the [Docker Agent JSON Schema](htt
 
 ## Config Versioning
 
-docker-agent configs are versioned. The current version is `5`. Add the version at the top of your config:
+docker-agent configs are versioned. The current version is `8`. Add the version at the top of your config:
 
 ```yaml
-version: 5
+version: 8
 
 agents:
   root:
-    model: openai/gpt-4o
+    model: openai/gpt-5-mini
     # ...
 ```
 
@@ -217,6 +332,32 @@ metadata:
 | `version`     | Semantic version string                    |
 
 See [Agent Distribution]({{ '/concepts/distribution/' | relative_url }}) for publishing agents to registries.
+
+## Reusable MCP Servers (`mcps:`)
+
+The top-level `mcps:` section defines named MCP server configurations that agents can reference with `toolsets: [{type: mcp, ref: <name>}]`. This avoids repeating the same command / URL / headers across agents and keeps credentials in one place.
+
+```yaml
+mcps:
+  github:
+    remote:
+      url: https://api.githubcopilot.com/mcp
+      transport_type: sse
+  playwright:
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-playwright"]
+
+agents:
+  root:
+    model: openai/gpt-5-mini
+    toolsets:
+      - type: mcp
+        ref: github        # reuse the definition above
+      - type: mcp
+        ref: playwright
+```
+
+An `mcps` entry accepts every field a regular `type: mcp` toolset accepts (command/args/env, `remote` with `url`/`transport_type`/`headers`/`oauth`, `tools` filter, `instruction`, `defer`, …) — the `type: mcp` is implicit. See the [Tool Config]({{ '/configuration/tools/' | relative_url }}) page for all options and the [Remote MCP Servers]({{ '/features/remote-mcp/' | relative_url }}) guide for remote setups.
 
 ## Custom Providers Section
 

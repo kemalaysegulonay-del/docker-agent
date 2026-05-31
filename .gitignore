@@ -1,6 +1,7 @@
 bin
 dist
 .task
+/.cache/
 .DS_Store
 evals
 *.db*
@@ -23,3 +24,8 @@ vendor
 /cagent-*
 /docker-mcp-*
 docker-agent
+
+# Generated wasm artifacts (built locally; see cmd/wasm/README.md)
+/wasm
+cmd/wasm/web/docker-agent.wasm
+cmd/wasm/web/wasm_exec.js

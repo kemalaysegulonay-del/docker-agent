@@ -59,7 +59,8 @@ func newChunkedVectorDB(dbPath string, vectorDimensions int, strategyName string
 }
 
 func (d *chunkedVectorDB) createSchema() error {
-	schema := fmt.Sprintf(`
+	schema := fmt.Sprintf( //nolint:gosec // table names are internal, no user input
+		`
 	CREATE TABLE IF NOT EXISTS %s (
 		source_path TEXT PRIMARY KEY,
 		file_hash TEXT NOT NULL,
@@ -77,7 +78,7 @@ func (d *chunkedVectorDB) createSchema() error {
 	);
 	`, d.filesTable, d.tablePrefix, d.filesTable, d.chunksTable, d.filesTable)
 
-	_, err := d.db.Exec(schema)
+	_, err := d.db.ExecContext(context.Background(), schema)
 	return err
 }
 
@@ -127,7 +128,8 @@ func (d *chunkedVectorDB) AddDocumentWithEmbedding(ctx context.Context, doc data
 
 // SearchSimilarVectors implements vectorStoreDB.
 func (d *chunkedVectorDB) SearchSimilarVectors(ctx context.Context, queryEmbedding []float64, limit int) ([]VectorSearchResultData, error) {
-	query := fmt.Sprintf(`
+	query := fmt.Sprintf( //nolint:gosec // table names are internal, no user input
+		`
 	SELECT c.source_path, c.chunk_index, c.content, c.embedding, f.file_hash, f.indexed_at
 	FROM %s c
 	JOIN %s f ON c.source_path = f.source_path
@@ -195,7 +197,7 @@ func (d *chunkedVectorDB) GetFileMetadata(ctx context.Context, sourcePath string
 		 GROUP BY f.source_path, f.file_hash, f.indexed_at`, d.filesTable, d.chunksTable),
 		sourcePath).Scan(&metadata.SourcePath, &metadata.FileHash, &metadata.LastIndexed, &metadata.ChunkCount)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -244,8 +246,5 @@ func (d *chunkedVectorDB) DeleteFileMetadata(ctx context.Context, sourcePath str
 }
 
 func (d *chunkedVectorDB) Close() error {
-	if _, err := d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		slog.Warn("Failed to checkpoint WAL before close", "error", err)
-	}
-	return d.db.Close()
+	return sqliteutil.CheckpointAndClose(d.db)
 }

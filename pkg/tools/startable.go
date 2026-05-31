@@ -14,27 +14,38 @@ type Describer interface {
 }
 
 // DescribeToolSet returns a short description for ts suitable for user-visible
-// messages. It unwraps a StartableToolSet, then delegates to Describer if
-// implemented. Falls back to the Go type name when not.
+// messages. It walks the wrapper chain (e.g. through WithName /
+// StartableToolSet) so any inner Describer is reachable; falls back to
+// the Go type name when no inner toolset implements Describer.
 func DescribeToolSet(ts ToolSet) string {
-	if s, ok := ts.(*StartableToolSet); ok {
-		ts = s.ToolSet
-	}
-	if d, ok := ts.(Describer); ok {
+	if d, ok := As[Describer](ts); ok {
 		if desc := d.Describe(); desc != "" {
 			return desc
 		}
+	}
+	// Unwrap once for the type-name fallback so wrappers don't show up
+	// as e.g. "*tools.namedToolSet".
+	if u, ok := ts.(Unwrapper); ok {
+		ts = u.Unwrap()
 	}
 	return fmt.Sprintf("%T", ts)
 }
 
 // StartableToolSet wraps a ToolSet with lazy, single-flight start semantics.
 // This is the canonical way to manage toolset lifecycle.
+//
+// It also de-duplicates start-failure warnings: when Start() fails repeatedly
+// (e.g. an MCP server is down), only the *first* failure of each streak is
+// reported via ShouldReportFailure(). A successful Start() automatically
+// clears the streak, so a future failure is again reported as fresh — no
+// caller-visible "recovery" event is needed.
 type StartableToolSet struct {
 	ToolSet
 
-	mu      sync.Mutex
-	started bool
+	mu              sync.Mutex
+	started         bool
+	inFailureStreak bool // true between the first failed Start and the next successful Start (or Stop)
+	pendingWarning  bool // true if the current streak's first failure has not yet been reported
 }
 
 // NewStartable wraps a ToolSet for lazy initialization.
@@ -64,10 +75,21 @@ func (s *StartableToolSet) Start(ctx context.Context) error {
 
 	if startable, ok := As[Startable](s.ToolSet); ok {
 		if err := startable.Start(ctx); err != nil {
+			// Queue a warning ONLY on the first failure of a streak so
+			// repeated retries don't re-queue duplicate warnings.
+			if !s.inFailureStreak {
+				s.inFailureStreak = true
+				s.pendingWarning = true
+			}
 			return err
 		}
 	}
+
+	// Successful start: clear the streak so any future failure is reported
+	// as fresh. This is the recovery path — it is intentionally silent.
 	s.started = true
+	s.inFailureStreak = false
+	s.pendingWarning = false
 	return nil
 }
 
@@ -78,10 +100,26 @@ func (s *StartableToolSet) Stop(ctx context.Context) error {
 	defer s.mu.Unlock()
 
 	s.started = false
+	s.inFailureStreak = false
+	s.pendingWarning = false
 	if startable, ok := As[Startable](s.ToolSet); ok {
 		return startable.Stop(ctx)
 	}
 	return nil
+}
+
+// ShouldReportFailure returns true exactly once per failure streak — after
+// the first failed Start() and before the streak ends (a successful
+// Start() or Stop()). Subsequent calls return false until a new streak
+// begins. Calling it when no failure is pending always returns false.
+func (s *StartableToolSet) ShouldReportFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.pendingWarning {
+		return false
+	}
+	s.pendingWarning = false
+	return true
 }
 
 // Unwrap returns the underlying ToolSet.

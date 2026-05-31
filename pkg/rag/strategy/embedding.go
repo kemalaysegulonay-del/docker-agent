@@ -16,7 +16,7 @@ import (
 // EmbeddingConfig holds configuration for creating an embedding provider.
 type EmbeddingConfig struct {
 	Provider    provider.Provider
-	ModelID     string // Full model ID for pricing (e.g., "openai/text-embedding-3-small")
+	ModelID     modelsdev.ID // Provider/model identity, used for pricing lookup.
 	ModelsStore *modelsdev.Store
 }
 
@@ -47,18 +47,21 @@ func CreateEmbeddingProvider(ctx context.Context, modelName string, buildCtx Bui
 	}
 
 	// Determine model ID for pricing lookup
-	var modelID string
+	var modelID modelsdev.ID
 	if modelName == "auto" {
 		modelID = embedModel.ID()
 	} else {
-		modelID = modelCfg.Provider + "/" + modelCfg.Model
+		modelID = modelsdev.NewID(modelCfg.Provider, modelCfg.Model)
 	}
 
-	// Create models.dev store for pricing
-	modelsStore, err := modelsdev.NewStore()
-	if err != nil {
-		slog.Debug("Failed to create models.dev store for RAG pricing; cost tracking disabled",
-			"error", err)
+	var modelsStore *modelsdev.Store
+	if buildCtx.RuntimeConfig != nil {
+		var err error
+		modelsStore, err = buildCtx.RuntimeConfig.ModelsDevStore()
+		if err != nil {
+			slog.DebugContext(ctx, "Failed to create models.dev store for RAG pricing; cost tracking disabled",
+				"error", err)
+		}
 	}
 
 	return &EmbeddingConfig{

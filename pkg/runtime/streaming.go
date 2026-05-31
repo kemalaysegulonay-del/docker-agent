@@ -12,7 +12,6 @@ import (
 	"github.com/docker/docker-agent/pkg/chat"
 	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/session"
-	"github.com/docker/docker-agent/pkg/telemetry"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
@@ -34,7 +33,13 @@ type streamResult struct {
 // events (content deltas, partial tool calls, reasoning tokens) and returning
 // the aggregated streamResult. The caller is responsible for adding the
 // resulting assistant message to the session.
-func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStream, a *agent.Agent, agentTools []tools.Tool, sess *session.Session, m *modelsdev.Model, events chan Event) (streamResult, error) {
+//
+// handleStream is a pure stream-aggregation routine: it does not touch
+// runtime state and can be unit-tested by feeding a mock chat.MessageStream.
+// It is intentionally a free function rather than a method on *LocalRuntime
+// so the dependency direction is explicit (the loop calls into the chunker,
+// never the reverse).
+func handleStream(ctx context.Context, stream chat.MessageStream, a *agent.Agent, agentTools []tools.Tool, sess *session.Session, m *modelsdev.Model, tel Telemetry, events EventSink) (streamResult, error) {
 	defer stream.Close()
 
 	var fullContent strings.Builder
@@ -48,8 +53,36 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 	toolCallIndex := make(map[string]int)   // toolCallID -> index in toolCalls slice
 	emittedPartial := make(map[string]bool) // toolCallID -> whether we've emitted a partial event
 	toolDefMap := make(map[string]tools.Tool, len(agentTools))
+
+	// xmlToolCallGate suppresses AgentChoice events once a <tool_call> tag is
+	// seen, preventing raw XML from rendering in the TUI.
+	xmlToolCallGate := false
 	for _, t := range agentTools {
 		toolDefMap[t.Name] = t
+	}
+
+	// applyXMLFallback extracts <tool_call> blocks from accumulated content when
+	// no structured tool calls were received. Called from both the early-return
+	// and EOF paths.
+	applyXMLFallback := func() {
+		if len(toolCalls) > 0 {
+			return
+		}
+		extracted, textBefore, found := extractXMLToolCalls(fullContent.String())
+		if !found {
+			return
+		}
+		slog.DebugContext(ctx, "XML tool call fallback triggered",
+			"agent", a.Name(),
+			"tool_calls", len(extracted),
+		)
+		toolCalls = extracted
+		fullContent.Reset()
+		fullContent.WriteString(textBefore)
+		for _, tc := range toolCalls {
+			toolDef := toolDefMap[tc.Function.Name]
+			events.Emit(PartialToolCall(tc, toolDef, a.Name()))
+		}
 	}
 
 	// recordUsage persists the final token counts and emits telemetry exactly
@@ -61,14 +94,14 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		}
 		usageRecorded = true
 
-		sess.InputTokens = messageUsage.InputTokens + messageUsage.CachedInputTokens + messageUsage.CacheWriteTokens
-		sess.OutputTokens = messageUsage.OutputTokens
+		input := messageUsage.InputTokens + messageUsage.CachedInputTokens + messageUsage.CacheWriteTokens
+		sess.SetUsage(input, messageUsage.OutputTokens)
 
 		modelName := "unknown"
 		if m != nil {
 			modelName = m.Name
 		}
-		telemetry.RecordTokenUsage(ctx, modelName, sess.InputTokens, sess.OutputTokens, sess.TotalCost())
+		tel.RecordTokenUsage(ctx, modelName, input, messageUsage.OutputTokens, sess.TotalCost())
 	}
 
 	for {
@@ -98,14 +131,19 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 
 		if choice.FinishReason == chat.FinishReasonStop || choice.FinishReason == chat.FinishReasonLength {
 			recordUsage()
+			applyXMLFallback()
+			finishReason := choice.FinishReason
+			if finishReason == chat.FinishReasonStop && len(toolCalls) > 0 {
+				finishReason = chat.FinishReasonToolCalls
+			}
 			return streamResult{
 				Calls:             toolCalls,
 				Content:           fullContent.String(),
 				ReasoningContent:  fullReasoningContent.String(),
 				ThinkingSignature: thinkingSignature,
 				ThoughtSignature:  thoughtSignature,
-				Stopped:           true,
-				FinishReason:      choice.FinishReason,
+				Stopped:           len(toolCalls) == 0, // stop only when there are no tool calls to execute
+				FinishReason:      finishReason,
 				Usage:             messageUsage,
 			}, nil
 		}
@@ -165,7 +203,7 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 						if !emittedPartial[delta.ID] {
 							toolDef = toolDefMap[tc.Function.Name]
 						}
-						events <- PartialToolCall(partial, toolDef, a.Name())
+						events.Emit(PartialToolCall(partial, toolDef, a.Name()))
 						emittedPartial[delta.ID] = true
 					}
 				}
@@ -174,7 +212,7 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		}
 
 		if choice.Delta.ReasoningContent != "" {
-			events <- AgentChoiceReasoning(a.Name(), sess.ID, choice.Delta.ReasoningContent)
+			events.Emit(AgentChoiceReasoning(a.Name(), sess.ID, choice.Delta.ReasoningContent))
 			fullReasoningContent.WriteString(choice.Delta.ReasoningContent)
 		}
 
@@ -184,12 +222,24 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		}
 
 		if choice.Delta.Content != "" {
-			events <- AgentChoice(a.Name(), sess.ID, choice.Delta.Content)
+			if !xmlToolCallGate {
+				tagIdx := strings.Index(choice.Delta.Content, "<tool_call>")
+				if tagIdx < 0 {
+					events.Emit(AgentChoice(a.Name(), sess.ID, choice.Delta.Content))
+				} else {
+					xmlToolCallGate = true
+					if tagIdx > 0 {
+						events.Emit(AgentChoice(a.Name(), sess.ID, choice.Delta.Content[:tagIdx]))
+					}
+				}
+			}
 			fullContent.WriteString(choice.Delta.Content)
 		}
 	}
 
 	recordUsage()
+
+	applyXMLFallback()
 
 	// If the stream completed without producing any content or tool calls, likely because of a token limit, stop to avoid breaking the request loop
 	// NOTE(krissetto): this can likely be removed once compaction works properly with all providers (aka dmr)
@@ -230,40 +280,4 @@ func (r *LocalRuntime) handleStream(ctx context.Context, stream chat.MessageStre
 		FinishReason:      finishReason,
 		Usage:             messageUsage,
 	}, nil
-}
-
-// stripImageContent returns a copy of messages with all image-related content
-// removed. This is used when the target model doesn't support image input to
-// prevent API errors. Text content is preserved; image parts in MultiContent
-// are filtered out, and file attachments with image MIME types are dropped.
-func stripImageContent(messages []chat.Message) []chat.Message {
-	result := make([]chat.Message, len(messages))
-	for i, msg := range messages {
-		result[i] = msg
-
-		if len(msg.MultiContent) == 0 {
-			continue
-		}
-
-		var filtered []chat.MessagePart
-		for _, part := range msg.MultiContent {
-			switch part.Type {
-			case chat.MessagePartTypeImageURL:
-				// Drop image URL parts entirely.
-				continue
-			case chat.MessagePartTypeFile:
-				// Drop file parts that are images.
-				if part.File != nil && chat.IsImageMimeType(part.File.MimeType) {
-					continue
-				}
-			}
-			filtered = append(filtered, part)
-		}
-
-		if len(filtered) != len(msg.MultiContent) {
-			result[i].MultiContent = filtered
-			slog.Debug("Stripped image content from message", "role", msg.Role, "original_parts", len(msg.MultiContent), "remaining_parts", len(filtered))
-		}
-	}
-	return result
 }

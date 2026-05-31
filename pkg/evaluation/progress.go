@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/docker/docker-agent/pkg/concurrent"
 )
 
 // progressBar provides a live-updating progress display for evaluation runs.
@@ -20,10 +22,10 @@ type progressBar struct {
 	completed       atomic.Int32
 	passed          atomic.Int32
 	failed          atomic.Int32
-	relevanceFailed atomic.Int32 // count of evals with relevance failures
-	sizeFailed      atomic.Int32 // count of evals with size failures
-	toolCallsFailed atomic.Int32 // count of evals with tool call failures
-	running         sync.Map     // map[string]bool for currently running evals
+	relevanceFailed atomic.Int32                     // count of evals with relevance failures
+	sizeFailed      atomic.Int32                     // count of evals with size failures
+	toolCallsFailed atomic.Int32                     // count of evals with tool call failures
+	running         concurrent.Map[string, struct{}] // titles of currently running evals
 	done            chan struct{}
 	stopped         chan struct{} // signals that the goroutine has finished
 	ticker          *time.Ticker
@@ -67,7 +69,7 @@ func (p *progressBar) stop() {
 }
 
 func (p *progressBar) setRunning(title string) {
-	p.running.Store(title, true)
+	p.running.Store(title, struct{}{})
 }
 
 func (p *progressBar) complete(title string, success bool) {
@@ -164,7 +166,7 @@ func (p *progressBar) render(final bool) {
 
 	// Calculate bar width based on terminal size
 	// Reserve space for: "[" + "]" + " 100% (999/999) " + counts (~20) + running info (~30)
-	barWidth := min(max(termWidth-80, 10), 10)
+	barWidth := min(max(termWidth-80, 10), 30)
 
 	filledWidth := 0
 	if p.total > 0 {
@@ -180,10 +182,10 @@ func (p *progressBar) render(final bool) {
 	// Count running evals
 	runningCount := 0
 	var firstName string
-	p.running.Range(func(key, _ any) bool {
+	p.running.Range(func(key string, _ struct{}) bool {
 		runningCount++
 		if firstName == "" {
-			firstName = key.(string)
+			firstName = key
 		}
 		return true
 	})
@@ -214,8 +216,8 @@ func (p *progressBar) render(final bool) {
 		// Calculate available space for running task name
 		availableForName := max(termWidth-len(status)-10, 5)
 		name := firstName
-		if len(name) > availableForName {
-			name = name[:availableForName-1] + "…"
+		if r := []rune(name); len(r) > availableForName {
+			name = string(r[:availableForName-1]) + "…"
 		}
 		if runningCount == 1 {
 			status += " | " + name

@@ -16,6 +16,7 @@ import (
 	"github.com/docker/docker-agent/pkg/config"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/environment"
+	"github.com/docker/docker-agent/pkg/js"
 	"github.com/docker/docker-agent/pkg/model/provider/dmr"
 	"github.com/docker/docker-agent/pkg/tools"
 )
@@ -66,7 +67,9 @@ func TestGetToolsForAgent_ContinuesOnCreateToolError(t *testing.T) {
 		EnvProviderForTests: &noEnvProvider{},
 	}
 
-	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, NewToolsetRegistry(), "test-config")
+	expander := js.NewJsExpander(runConfig.EnvProvider())
+
+	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, &toolsetRegistry{}, "test-config", expander)
 
 	require.Empty(t, got)
 	require.NotEmpty(t, warnings)
@@ -76,9 +79,51 @@ func TestGetToolsForAgent_ContinuesOnCreateToolError(t *testing.T) {
 func TestLoadExamples(t *testing.T) {
 	examples := collectExamples(t)
 
-	// Collect required env vars from all examples by checking configs directly.
-	// This avoids calling Load() twice for each example.
-	missingEnvs := make(map[string]bool)
+	// Set every env var referenced by the examples to a dummy value so model
+	// and tool initialisation succeeds without real credentials.
+	for env := range gatherExampleEnvVars(t, examples) {
+		t.Setenv(env, "dummy")
+	}
+
+	for _, agentFilename := range examples {
+		t.Run(agentFilename, func(t *testing.T) {
+			t.Parallel()
+
+			data, err := os.ReadFile(agentFilename)
+			require.NoError(t, err)
+
+			// Examples must not pin a version: they should always parse with
+			// the latest config schema.
+			var v struct {
+				Version string `yaml:"version"`
+			}
+			require.NoError(t, yaml.Unmarshal(data, &v))
+			require.Empty(t, v.Version, "example %s should not define a version", agentFilename)
+
+			// Use a bytes source (ParentDir == "") plus a temp WorkingDir so
+			// toolsets that write to disk (memory, RAG, cache, ...) land in
+			// the temp dir instead of the examples/ tree.
+			agentSource := config.NewBytesSource(agentFilename, data)
+			runConfig := &config.RuntimeConfig{}
+			runConfig.WorkingDir = t.TempDir()
+
+			teams, err := Load(t.Context(), agentSource, runConfig)
+			if errors.Is(err, dmr.ErrNotInstalled) {
+				t.Skipf("Skipping %s: Docker Model Runner not installed", agentFilename)
+			}
+			require.NoError(t, err)
+			assert.NotEmpty(t, teams)
+		})
+	}
+}
+
+// gatherExampleEnvVars returns the union of env vars referenced by the given
+// example files (both for models and toolsets). The set is collected up-front
+// so t.Setenv can be called before any subtest starts.
+func gatherExampleEnvVars(t *testing.T, examples []string) map[string]bool {
+	t.Helper()
+
+	envs := make(map[string]bool)
 	for _, agentFilename := range examples {
 		agentSource, err := config.Resolve(agentFilename, nil)
 		require.NoError(t, err)
@@ -87,53 +132,14 @@ func TestLoadExamples(t *testing.T) {
 		require.NoError(t, err)
 
 		for _, env := range config.GatherEnvVarsForModels(cfg) {
-			missingEnvs[env] = true
+			envs[env] = true
 		}
-
 		toolEnvs, _ := config.GatherEnvVarsForTools(t.Context(), cfg)
 		for _, env := range toolEnvs {
-			missingEnvs[env] = true
+			envs[env] = true
 		}
 	}
-
-	for name := range missingEnvs {
-		t.Setenv(name, "dummy")
-	}
-
-	runConfig := &config.RuntimeConfig{}
-
-	type versioned struct {
-		Version string `yaml:"version"`
-	}
-
-	// Load all the examples.
-	// Note: don't use t.Parallel() to avoid SQLite lock contention when
-	// multiple RAG examples share the same relative database paths (e.g., ./bm25.db).
-	for _, agentFilename := range examples {
-		t.Run(agentFilename, func(t *testing.T) {
-			agentSource, err := config.Resolve(agentFilename, nil)
-			require.NoError(t, err)
-
-			// First make sure it doesn't define a version
-			data, err := agentSource.Read(t.Context())
-			require.NoError(t, err)
-
-			var v versioned
-			err = yaml.Unmarshal(data, &v)
-			require.NoError(t, err)
-			require.Empty(t, v.Version, "example %s should not define a version", agentFilename)
-
-			// Then make sure the config loads successfully
-			teams, err := Load(t.Context(), agentSource, runConfig)
-			if err != nil {
-				if errors.Is(err, dmr.ErrNotInstalled) && filepath.Base(agentFilename) == "dmr.yaml" {
-					t.Skip("Skipping DMR example: Docker Model Runner not installed")
-				}
-			}
-			require.NoError(t, err)
-			assert.NotEmpty(t, teams)
-		})
-	}
+	return envs
 }
 
 func TestLoadDefaultAgent(t *testing.T) {
@@ -190,10 +196,34 @@ func TestOverrideModel(t *testing.T) {
 				require.NoError(t, err)
 				rootAgent, err := team.Agent("root")
 				require.NoError(t, err)
-				require.Equal(t, test.expected, rootAgent.Model().ID())
+				require.Equal(t, test.expected, rootAgent.Model(t.Context()).ID().String())
 			}
 		})
 	}
+}
+
+func TestLoadHarnessAgentWithoutModel(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	data := []byte(`agents:
+  root:
+    model: openai/gpt-4o
+    sub_agents: [coder]
+  coder:
+    description: External coder
+    instruction: You are a coding agent.
+    harness:
+      type: codex
+`)
+
+	team, err := Load(t.Context(), config.NewBytesSource("harness.yaml", data), &config.RuntimeConfig{})
+	require.NoError(t, err)
+
+	coder, err := team.Agent("coder")
+	require.NoError(t, err)
+	require.True(t, coder.HasHarness())
+	require.Equal(t, "codex", coder.Harness().Type)
+	require.Nil(t, coder.Model(t.Context()))
 }
 
 func TestToolsetInstructions(t *testing.T) {
@@ -214,6 +244,31 @@ func TestToolsetInstructions(t *testing.T) {
 	instructions := tools.GetInstructions(toolsets[0])
 	expected := "Dummy fetch tool instruction"
 	require.Equal(t, expected, instructions)
+}
+
+// TestInstructionExpansion verifies that ${env.X} placeholders are expanded
+// at load time both in agent.instruction and in toolsets[*].instruction.
+// See https://github.com/docker/docker-agent/issues/2614.
+func TestInstructionExpansion(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+	t.Setenv("USER", "alice")
+
+	agentSource, err := config.Resolve("testdata/instruction-expansion.yaml", nil)
+	require.NoError(t, err)
+
+	team, err := Load(t.Context(), agentSource, &config.RuntimeConfig{})
+	require.NoError(t, err)
+
+	rootAgent, err := team.Agent("root")
+	require.NoError(t, err)
+
+	// agents.<name>.instruction must be expanded.
+	assert.Equal(t, "Hello alice, you are running in staging", rootAgent.Instruction())
+
+	// toolsets[*].instruction must also be expanded.
+	toolsets := rootAgent.ToolSets()
+	require.Len(t, toolsets, 1)
+	assert.Equal(t, "Fetch as alice", tools.GetInstructions(toolsets[0]))
 }
 
 func TestAutoModelFallbackError(t *testing.T) {
@@ -411,7 +466,9 @@ func TestGetToolsForAgent_MultipleLSPToolsetsAreCombined(t *testing.T) {
 		EnvProviderForTests: &noEnvProvider{},
 	}
 
-	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, NewDefaultToolsetRegistry(), "test-config")
+	expander := js.NewJsExpander(runConfig.EnvProvider())
+
+	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, NewDefaultToolsetRegistry(), "test-config", expander)
 	require.Empty(t, warnings)
 
 	// Should have exactly one toolset (the multiplexer)
@@ -451,7 +508,9 @@ func TestGetToolsForAgent_SingleLSPToolsetNotWrapped(t *testing.T) {
 		EnvProviderForTests: &noEnvProvider{},
 	}
 
-	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, NewDefaultToolsetRegistry(), "test-config")
+	expander := js.NewJsExpander(runConfig.EnvProvider())
+
+	got, warnings := getToolsForAgent(t.Context(), a, ".", &runConfig, NewDefaultToolsetRegistry(), "test-config", expander)
 	require.Empty(t, warnings)
 
 	// Should have exactly one toolset that provides LSP tools.
@@ -482,4 +541,32 @@ func TestExternalDepthContext(t *testing.T) {
 	// Nested overrides
 	ctx = contextWithExternalDepth(ctx, 7)
 	assert.Equal(t, 7, externalDepthFromContext(ctx))
+}
+
+func TestLoadWithConfig_CachePathTraversal(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "dummy")
+
+	tmpDir := t.TempDir()
+
+	// Create a config file with a path traversal attempt
+	configPath := filepath.Join(tmpDir, "agent.yaml")
+	configContent := `
+agents:
+  root:
+    model: openai/gpt-4o
+    description: Test agent
+    instruction: You are a test agent.
+    cache:
+      enabled: true
+      path: ../../../../etc/passwd
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
+
+	source := config.NewFileSource(configPath)
+	runConfig := &config.RuntimeConfig{}
+	runConfig.WorkingDir = tmpDir
+
+	_, err := LoadWithConfig(t.Context(), source, runConfig)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "escapes parent directory")
 }

@@ -160,6 +160,42 @@ Body`,
 			wantOK: true,
 		},
 		{
+			name: "model override (named)",
+			content: `---
+name: model-skill
+description: A skill that overrides the model
+context: fork
+model: my_fast_model
+---
+
+Body`,
+			want: Skill{
+				Name:        "model-skill",
+				Description: "A skill that overrides the model",
+				Context:     "fork",
+				Model:       "my_fast_model",
+			},
+			wantOK: true,
+		},
+		{
+			name: "model override (inline provider/model)",
+			content: `---
+name: inline-model-skill
+description: Skill with inline provider/model override
+context: fork
+model: openai/gpt-4o-mini
+---
+
+Body`,
+			want: Skill{
+				Name:        "inline-model-skill",
+				Description: "Skill with inline provider/model override",
+				Context:     "fork",
+				Model:       "openai/gpt-4o-mini",
+			},
+			wantOK: true,
+		},
+		{
 			name:    "allowed-tools list with quoted items",
 			content: "---\nname: quoted-tools\ndescription: Skill with quoted tool items\nallowed-tools:\n  - \"Bash(git:*)\"\n  - 'Read'\n---\n\nBody",
 			want: Skill{
@@ -192,6 +228,7 @@ Body`,
 				assert.Equal(t, tt.want.Metadata, got.Metadata)
 				assert.Equal(t, tt.want.AllowedTools, got.AllowedTools)
 				assert.Equal(t, tt.want.Context, got.Context)
+				assert.Equal(t, tt.want.Model, got.Model)
 			}
 		})
 	}
@@ -681,6 +718,52 @@ func TestFindGitRoot(t *testing.T) {
 		got := findGitRoot(tmpDir)
 		assert.Empty(t, got)
 	})
+}
+
+func TestLoad_KitDirOverridesEverything(t *testing.T) {
+	// Inside a sandbox the host stages a kit. The kit's skills directory
+	// is the *only* search root — host paths like ~/.agents/skills or
+	// .claude/skills under cwd are intentionally ignored because they
+	// don't exist inside the sandbox.
+	tmpHome := t.TempDir()
+	t.Setenv("HOME", tmpHome)
+
+	// Stage a host-only skill the test must NOT see.
+	hostSkillDir := filepath.Join(tmpHome, ".agents", "skills", "host-only")
+	require.NoError(t, os.MkdirAll(hostSkillDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(hostSkillDir, "SKILL.md"),
+		[]byte("---\nname: host-only\ndescription: must be hidden\n---\n"), 0o644))
+
+	// Stage a kit skill the test MUST see.
+	kitDir := t.TempDir()
+	kitSkillDir := filepath.Join(kitDir, KitSkillsSubdir, "from-kit")
+	require.NoError(t, os.MkdirAll(kitSkillDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(kitSkillDir, "SKILL.md"),
+		[]byte("---\nname: from-kit\ndescription: kit skill\n---\n"), 0o644))
+
+	t.Setenv(KitDirEnv, kitDir)
+	t.Chdir(t.TempDir())
+
+	skills := Load([]string{"local"})
+
+	names := make([]string, 0, len(skills))
+	for _, s := range skills {
+		names = append(names, s.Name)
+	}
+	assert.Contains(t, names, "from-kit")
+	assert.NotContains(t, names, "host-only", "host paths must be ignored when a kit is set")
+}
+
+func TestIsHomeSkillPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	assert.True(t, IsHomeSkillPath(filepath.Join(home, ".codex", "skills", "skill-a")))
+	assert.True(t, IsHomeSkillPath(filepath.Join(home, ".claude", "skills", "skill-b")))
+	assert.True(t, IsHomeSkillPath(filepath.Join(home, ".agents", "skills", "skill-c")))
+	assert.False(t, IsHomeSkillPath(filepath.Join(home, "work", "repo", ".agents", "skills", "project-skill")))
+	assert.False(t, IsHomeSkillPath(filepath.Join(filepath.Dir(home), "elsewhere", "skill")))
 }
 
 func TestSkill_IsFork(t *testing.T) {

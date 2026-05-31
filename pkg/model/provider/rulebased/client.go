@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 
 	"github.com/blevesearch/bleve/v2"
@@ -21,12 +22,13 @@ import (
 	"github.com/docker/docker-agent/pkg/environment"
 	"github.com/docker/docker-agent/pkg/model/provider/base"
 	"github.com/docker/docker-agent/pkg/model/provider/options"
+	"github.com/docker/docker-agent/pkg/modelsdev"
 	"github.com/docker/docker-agent/pkg/tools"
 )
 
 // Provider defines the minimal interface needed for model providers.
 type Provider interface {
-	ID() string
+	ID() modelsdev.ID
 	CreateChatCompletionStream(
 		ctx context.Context,
 		messages []chat.Message,
@@ -47,14 +49,14 @@ type Client struct {
 	fallback       Provider
 	index          bleve.Index
 	mu             sync.RWMutex
-	lastSelectedID string // ID of the provider selected by the most recent call
+	lastSelectedID modelsdev.ID // ID of the provider selected by the most recent call
 }
 
 // NewClient creates a new rule-based routing client.
 // The cfg parameter should have Routing rules configured. The provider/model
 // fields of cfg define the fallback model that is used when no routing rule matches.
 func NewClient(ctx context.Context, cfg *latest.ModelConfig, models map[string]latest.ModelConfig, env environment.Provider, providerFactory ProviderFactory, opts ...options.Opt) (*Client, error) {
-	slog.Debug("Creating rule-based router", "provider", cfg.Provider, "model", cfg.Model)
+	slog.DebugContext(ctx, "Creating rule-based router", "provider", cfg.Provider, "model", cfg.Model)
 
 	if len(cfg.Routing) == 0 {
 		return nil, errors.New("no routing rules configured")
@@ -171,9 +173,9 @@ func (c *Client) CreateChatCompletionStream(
 	c.mu.Lock()
 	c.lastSelectedID = selectedID
 	c.mu.Unlock()
-	slog.Debug("Rule-based router selected model",
-		"router", c.ID(),
-		"selected_model", selectedID,
+	slog.DebugContext(ctx, "Rule-based router selected model",
+		"router", c.ID().String(),
+		"selected_model", selectedID.String(),
 		"message_count", len(messages),
 	)
 
@@ -183,7 +185,7 @@ func (c *Client) CreateChatCompletionStream(
 // LastSelectedModelID returns the ID of the provider selected by the most
 // recent CreateChatCompletionStream call. This allows callers to display
 // the YAML-configured sub-model name for rule-based routing.
-func (c *Client) LastSelectedModelID() string {
+func (c *Client) LastSelectedModelID() modelsdev.ID {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.lastSelectedID
@@ -222,7 +224,7 @@ func (c *Client) selectProvider(messages []chat.Message) Provider {
 
 	selected := c.routes[routeIdx]
 	slog.Debug("Route matched",
-		"model", selected.ID(),
+		"model", selected.ID().String(),
 		"score", hit.Score,
 	)
 	return selected
@@ -248,9 +250,9 @@ func (c *Client) defaultProvider() Provider {
 }
 
 func getLastUserMessage(messages []chat.Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == chat.MessageRoleUser {
-			return messages[i].Content
+	for _, message := range slices.Backward(messages) {
+		if message.Role == chat.MessageRoleUser {
+			return message.Content
 		}
 	}
 	return ""

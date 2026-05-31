@@ -35,6 +35,13 @@ func addRuntimeConfigFlags(cmd *cobra.Command, runConfig *config.RuntimeConfig) 
 	cmd.PersistentFlags().StringArrayVar(&runConfig.HookSessionStart, "hook-session-start", nil, "Add a session-start hook command (repeatable)")
 	cmd.PersistentFlags().StringArrayVar(&runConfig.HookSessionEnd, "hook-session-end", nil, "Add a session-end hook command (repeatable)")
 	cmd.PersistentFlags().StringArrayVar(&runConfig.HookOnUserInput, "hook-on-user-input", nil, "Add an on-user-input hook command (repeatable)")
+	cmd.PersistentFlags().StringArrayVar(&runConfig.HookStop, "hook-stop", nil, "Add a stop hook command, fired when the model finishes responding (repeatable)")
+	cmd.PersistentFlags().StringVar(&runConfig.MCPOAuthRedirectURI, "mcp-oauth-redirect-uri", "",
+		"Public HTTPS URL to advertise as the OAuth `redirect_uri` for MCP servers "+
+			"running in unmanaged OAuth mode. When set, docker-agent drives the OAuth flow "+
+			"itself (PKCE + DCR + token exchange) and expects clients to return `{code, state}` "+
+			"via ResumeElicitation. When empty, the client is expected to perform the OAuth "+
+			"flow and return an access token (legacy behavior).")
 }
 
 func setupWorkingDirectory(workingDir string) error {
@@ -75,13 +82,24 @@ func addGatewayFlags(cmd *cobra.Command, runConfig *config.RuntimeConfig) {
 
 	persistentPreRunE := cmd.PersistentPreRunE
 	cmd.PersistentPreRunE = func(_ *cobra.Command, args []string) error {
+		ctx := cmd.Context()
+
+		// Run any inherited PersistentPreRunE first so directory
+		// overrides (--config-dir, --cache-dir, --data-dir) and other
+		// global setup land before we materialise the env provider —
+		// otherwise the cached provider chain captures a stale config
+		// dir and breaks downstream consumers like the sandbox token
+		// reader.
+		if err := runParentPreRun(cmd, persistentPreRunE, args); err != nil {
+			return err
+		}
+
 		userCfg, err := loadUserConfig()
 		if err != nil {
-			slog.Warn("Failed to load user config", "error", err)
+			slog.WarnContext(ctx, "Failed to load user config", "error", err)
 			userCfg = &userconfig.Config{}
 		}
 
-		ctx := cmd.Context()
 		env := runConfig.EnvProvider()
 
 		// Precedence: CLI flag > environment variable > user config
@@ -105,25 +123,27 @@ func addGatewayFlags(cmd *cobra.Command, runConfig *config.RuntimeConfig) {
 			runConfig.DefaultModel = &userCfg.DefaultModel.ModelConfig
 		}
 
-		if err := setupWorkingDirectory(runConfig.WorkingDir); err != nil {
-			return err
-		}
-
-		if persistentPreRunE != nil {
-			return persistentPreRunE(cmd, args)
-		}
-		// Walk up the ancestor chain to find and call the nearest PersistentPreRunE.
-		// A single cmd.Parent() check is not sufficient when this command is nested
-		// more than one level deep (e.g. root → serve → api): the immediate parent
-		// may have no PersistentPreRunE, but a grandparent (such as root) might.
-		for p := cmd.Parent(); p != nil; p = p.Parent() {
-			if p.PersistentPreRunE != nil {
-				return p.PersistentPreRunE(cmd, args)
-			}
-		}
-
-		return nil
+		return setupWorkingDirectory(runConfig.WorkingDir)
 	}
+}
+
+// runParentPreRun runs the cobra PersistentPreRunE that should fire
+// before this command's own. It first invokes the directly-captured
+// hook (if any) and otherwise walks up the ancestor chain to find the
+// nearest PersistentPreRunE — which matters when the command is nested
+// more than one level deep (e.g. root → serve → api): the immediate
+// parent may have no PersistentPreRunE, but a grandparent (such as
+// root) might.
+func runParentPreRun(cmd *cobra.Command, captured func(*cobra.Command, []string) error, args []string) error {
+	if captured != nil {
+		return captured(cmd, args)
+	}
+	for p := cmd.Parent(); p != nil; p = p.Parent() {
+		if p.PersistentPreRunE != nil {
+			return p.PersistentPreRunE(cmd, args)
+		}
+	}
+	return nil
 }
 
 // parseModelShorthand parses "provider/model" into a ModelConfig

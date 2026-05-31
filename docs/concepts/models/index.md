@@ -19,7 +19,7 @@ Use the `provider/model` shorthand directly in the agent definition:
 ```yaml
 agents:
   root:
-    model: openai/gpt-4o
+    model: openai/gpt-5-mini
     instruction: You are a helpful assistant.
 ```
 
@@ -31,7 +31,7 @@ Define models in a `models` section and reference them by name:
 models:
   claude:
     provider: anthropic
-    model: claude-sonnet-4-0
+    model: claude-sonnet-4-5
     max_tokens: 64000
     temperature: 0.7
 
@@ -45,15 +45,21 @@ Named models let you configure temperature, token limits, thinking budgets, and 
 
 ## Supported Providers
 
-| Provider            | Key              | Example Models                       | API Key Env Var     |
-| ------------------- | ---------------- | ------------------------------------ | ------------------- |
-| OpenAI              | `openai`         | gpt-4o, gpt-5, gpt-5-mini            | `OPENAI_API_KEY`    |
-| Anthropic           | `anthropic`      | claude-sonnet-4-0, claude-sonnet-4-5 | `ANTHROPIC_API_KEY` |
-| Google              | `google`         | gemini-2.5-flash, gemini-3-pro       | `GOOGLE_API_KEY`    |
-| AWS Bedrock         | `amazon-bedrock` | Claude, Nova, Llama models           | AWS credentials     |
-| Docker Model Runner | `dmr`            | ai/qwen3, ai/llama3.2                | None (local)        |
-| Mistral             | `mistral`        | Mistral models                       | `MISTRAL_API_KEY`   |
-| xAI                 | `xai`            | Grok models                          | `XAI_API_KEY`       |
+| Provider            | Key              | Example Models                       | API Key Env Var                     |
+| ------------------- | ---------------- | ------------------------------------ | ----------------------------------- |
+| OpenAI              | `openai`         | gpt-5, gpt-5-mini, gpt-4o            | `OPENAI_API_KEY`                    |
+| Anthropic           | `anthropic`      | claude-sonnet-4-5, claude-opus-4-7   | `ANTHROPIC_API_KEY`                 |
+| Google              | `google`         | gemini-2.5-flash, gemini-3-pro       | `GOOGLE_API_KEY` / `GEMINI_API_KEY` |
+| AWS Bedrock         | `amazon-bedrock` | Claude, Nova, Llama models           | AWS credentials                     |
+| Docker Model Runner | `dmr`            | ai/qwen3, ai/llama3.2                | None (local)                        |
+| Mistral             | `mistral`        | Mistral models                       | `MISTRAL_API_KEY`                   |
+| xAI                 | `xai`            | Grok models                          | `XAI_API_KEY`                       |
+| Nebius              | `nebius`         | Open-source and specialised models   | `NEBIUS_API_KEY`                    |
+| MiniMax             | `minimax`        | MiniMax models                       | `MINIMAX_API_KEY`                   |
+| Requesty            | `requesty`       | Multi-provider gateway               | `REQUESTY_API_KEY`                  |
+| Azure OpenAI        | `azure`          | gpt-4o, gpt-5 on Azure               | `AZURE_API_KEY` + `base_url`        |
+| Ollama              | `ollama`         | Any local Ollama model               | None (local; optional `base_url`)   |
+| GitHub Copilot      | `github-copilot` | Copilot-hosted OpenAI/Anthropic      | `GITHUB_TOKEN` (PAT with `copilot`) |
 
 See the [Model Providers]({{ '/providers/overview/' | relative_url }}) section for detailed configuration guides.
 
@@ -99,7 +105,7 @@ models:
 ```
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Multi-provider teams
+<div class="callout-title">Multi-provider teams
 </div>
   <p>Different agents can use different providers in the same config. See <a href="{{ '/concepts/multi-agent/' | relative_url }}">Multi-Agent</a> for patterns.</p>
 
@@ -112,7 +118,7 @@ models:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0,openai/gpt-5-mini
+    model: anthropic/claude-sonnet-4-5,openai/gpt-5-mini
     instruction: You are a helpful assistant.
 ```
 

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/docker/docker-agent/pkg/cache"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/config/types"
 	"github.com/docker/docker-agent/pkg/model/provider"
@@ -32,6 +34,7 @@ type Agent struct {
 	addDate                 bool
 	addEnvironmentInfo      bool
 	addDescriptionParameter bool
+	redactSecrets           bool
 	maxIterations           int
 	maxConsecutiveToolCalls int
 	maxOldToolCallTokens    int
@@ -39,8 +42,15 @@ type Agent struct {
 	addPromptFiles          []string
 	tools                   []tools.Tool
 	commands                types.Commands
-	pendingWarnings         []string
+	harness                 *latest.HarnessConfig
 	hooks                   *latest.HooksConfig
+	cache                   *cache.Cache
+
+	// warningsMu guards pendingWarnings. AddToolWarning and DrainWarnings
+	// may be called concurrently from the runtime loop, the MCP server,
+	// the TUI and session manager.
+	warningsMu      sync.Mutex
+	pendingWarnings []string
 }
 
 // New creates a new agent
@@ -72,6 +82,18 @@ func (a *Agent) AddDate() bool {
 
 func (a *Agent) AddEnvironmentInfo() bool {
 	return a.addEnvironmentInfo
+}
+
+// RedactSecrets reports whether the agent has opted into the
+// redact_secrets feature. When true, the runtime auto-injects the
+// redact_secrets pre_tool_use builtin (scrubs tool arguments),
+// enables the runtime's before_llm_call message transform (scrubs
+// outgoing chat content), AND wires the dispatcher's tool-output
+// scrub (redacts tool output at the source so it never reaches event
+// consumers, the persisted session file, the post_tool_use hook
+// input, or the next LLM call).
+func (a *Agent) RedactSecrets() bool {
+	return a.redactSecrets
 }
 
 func (a *Agent) MaxIterations() int {
@@ -127,7 +149,11 @@ func (a *Agent) HasSubAgents() bool {
 // Model returns the model to use for this agent.
 // If model override(s) are set, it returns one of the overrides (randomly for alloy).
 // Otherwise, it returns a random model from the available models.
-func (a *Agent) Model() provider.Provider {
+//
+// ctx is used for log correlation only — the selection itself is local.
+// Pass [context.TODO] from callers that don't have a request context
+// (configuration validation, debug commands).
+func (a *Agent) Model(ctx context.Context) provider.Provider {
 	var selected provider.Provider
 	var poolSize int
 	// Check for model override first (set via TUI model switching)
@@ -135,10 +161,13 @@ func (a *Agent) Model() provider.Provider {
 		selected = (*overrides)[rand.Intn(len(*overrides))]
 		poolSize = len(*overrides)
 	} else {
+		if len(a.models) == 0 {
+			return nil
+		}
 		selected = a.models[rand.Intn(len(a.models))]
 		poolSize = len(a.models)
 	}
-	slog.Info("Model selected", "agent", a.name, "model", selected.ID(), "pool_size", poolSize)
+	slog.InfoContext(ctx, "Model selected", "agent", a.name, "model", selected.ID(), "pool_size", poolSize)
 	return selected
 }
 
@@ -146,7 +175,13 @@ func (a *Agent) Model() provider.Provider {
 // The override(s) take precedence over the configured models.
 // For alloy models, multiple providers can be passed and one will be randomly selected.
 // Pass no arguments or nil providers to clear the override.
-func (a *Agent) SetModelOverride(models ...provider.Provider) {
+//
+// SetModelOverride returns a snapshot of the value that was just stored.
+// Callers performing a scoped override (apply now, restore later) should
+// keep this snapshot and pass it as `current` to RestoreModelOverride so
+// the deferred restore can detect concurrent changes via CAS. Callers
+// that only need the side-effect can ignore the return value.
+func (a *Agent) SetModelOverride(models ...provider.Provider) ModelOverrideSnapshot {
 	// Filter out nil providers
 	var validModels []provider.Provider
 	for _, m := range models {
@@ -155,23 +190,59 @@ func (a *Agent) SetModelOverride(models ...provider.Provider) {
 		}
 	}
 
+	var ptr *[]provider.Provider
 	if len(validModels) == 0 {
 		a.modelOverrides.Store(nil)
 		slog.Debug("Cleared model override", "agent", a.name)
 	} else {
-		a.modelOverrides.Store(&validModels)
+		ptr = &validModels
+		a.modelOverrides.Store(ptr)
 		ids := make([]string, len(validModels))
 		for i, m := range validModels {
-			ids[i] = m.ID()
+			ids[i] = m.ID().String()
 		}
 		slog.Debug("Set model override", "agent", a.name, "models", ids)
 	}
+	return ModelOverrideSnapshot{ptr: ptr}
 }
 
 // HasModelOverride returns true if a model override is currently set.
 func (a *Agent) HasModelOverride() bool {
 	overrides := a.modelOverrides.Load()
 	return overrides != nil && len(*overrides) > 0
+}
+
+// ModelOverrideSnapshot is an opaque token that captures the agent's model
+// override at a point in time. Pass it to RestoreModelOverride to undo a
+// scoped override safely.
+type ModelOverrideSnapshot struct {
+	// ptr is the raw atomic pointer value at snapshot time. It is used for
+	// pointer-identity compare-and-swap, never dereferenced by callers.
+	ptr *[]provider.Provider
+}
+
+// SnapshotModelOverride captures the agent's current model override. The
+// returned snapshot is opaque; pass it to RestoreModelOverride later to
+// restore the captured value.
+func (a *Agent) SnapshotModelOverride() ModelOverrideSnapshot {
+	return ModelOverrideSnapshot{ptr: a.modelOverrides.Load()}
+}
+
+// RestoreModelOverride atomically restores the override to the value
+// captured by `prev`, but only if the current override is still the one
+// captured by `current` (pointer identity). If another caller has changed
+// the override since `current` was captured, the restore is a no-op so
+// that the concurrent change wins.
+//
+// This is the safe primitive for applying a temporary override around a
+// scope (e.g. a skill sub-session) without clobbering changes made by
+// concurrent callers such as the TUI model picker.
+func (a *Agent) RestoreModelOverride(prev, current ModelOverrideSnapshot) {
+	if a.modelOverrides.CompareAndSwap(current.ptr, prev.ptr) {
+		slog.Debug("Restored model override", "agent", a.name)
+	} else {
+		slog.Debug("Model override changed concurrently; skipping restore", "agent", a.name)
+	}
 }
 
 // ConfiguredModels returns the originally configured models for this agent.
@@ -201,9 +272,24 @@ func (a *Agent) Commands() types.Commands {
 	return a.commands
 }
 
+// Harness returns the external coding harness configuration for this agent.
+func (a *Agent) Harness() *latest.HarnessConfig {
+	return a.harness
+}
+
+func (a *Agent) HasHarness() bool {
+	return a.harness != nil
+}
+
 // Hooks returns the hooks configuration for this agent.
 func (a *Agent) Hooks() *latest.HooksConfig {
 	return a.hooks
+}
+
+// Cache returns the response cache configured for this agent, or nil when
+// caching is disabled.
+func (a *Agent) Cache() *cache.Cache {
+	return a.cache
 }
 
 // Tools returns the tools available to this agent
@@ -231,8 +317,8 @@ func (a *Agent) collectTools(ctx context.Context) ([]tools.Tool, error) {
 		ta, err := toolSet.Tools(ctx)
 		if err != nil {
 			desc := tools.DescribeToolSet(toolSet)
-			slog.Warn("Toolset listing failed; skipping", "agent", a.Name(), "toolset", desc, "error", err)
-			a.addToolWarning(fmt.Sprintf("%s list failed: %v", desc, err))
+			slog.WarnContext(ctx, "Toolset listing failed; skipping", "agent", a.Name(), "toolset", desc, "error", err)
+			a.AddToolWarning(fmt.Sprintf("%s list failed: %v", desc, err))
 			continue
 		}
 		agentTools = append(agentTools, ta...)
@@ -257,30 +343,49 @@ func (a *Agent) ToolSets() []tools.ToolSet {
 	return toolSets
 }
 
+// ensureToolSetsAreStarted starts every toolset, surfacing the first
+// failure of each streak as a user-visible warning and silently retrying
+// on every subsequent turn. A successful Start() automatically resets the
+// streak inside StartableToolSet, so a future failure is again reported
+// as fresh — no recovery callback is needed here, and we deliberately do
+// not surface a "now available" notice (the OAuth dialog completing or
+// the model just using the tool already makes a successful start
+// obvious; a follow-up notification just reads as a spurious warning).
 func (a *Agent) ensureToolSetsAreStarted(ctx context.Context) {
 	for _, toolSet := range a.toolsets {
-		if err := toolSet.Start(ctx); err != nil {
-			desc := tools.DescribeToolSet(toolSet)
-			slog.Warn("Toolset start failed; skipping", "agent", a.Name(), "toolset", desc, "error", err)
-			a.addToolWarning(fmt.Sprintf("%s start failed: %v", desc, err))
+		err := toolSet.Start(ctx)
+		if err == nil {
 			continue
+		}
+		desc := tools.DescribeToolSet(toolSet)
+		if toolSet.ShouldReportFailure() {
+			slog.WarnContext(ctx, "Toolset start failed; will retry on next turn", "agent", a.Name(), "toolset", desc, "error", err)
+			a.AddToolWarning(fmt.Sprintf("%s start failed: %v", desc, err))
+		} else {
+			slog.DebugContext(ctx, "Toolset still unavailable; retrying next turn", "agent", a.Name(), "toolset", desc, "error", err)
 		}
 	}
 }
 
-// addToolWarning records a warning generated while loading or starting toolsets.
-func (a *Agent) addToolWarning(msg string) {
+// AddToolWarning records a warning generated while loading or starting toolsets.
+// Warnings represent real failures the user should know about (a remote MCP
+// server returning 4xx, an MCP binary missing, ...). Recoveries from a
+// previous failure are intentionally not surfaced: the OAuth dialog and
+// subsequent tool use already make a successful start obvious, so emitting
+// a "now available" notification only adds noise.
+func (a *Agent) AddToolWarning(msg string) {
 	if msg == "" {
 		return
 	}
+	a.warningsMu.Lock()
 	a.pendingWarnings = append(a.pendingWarnings, msg)
+	a.warningsMu.Unlock()
 }
 
 // DrainWarnings returns pending warnings and clears them.
 func (a *Agent) DrainWarnings() []string {
-	if len(a.pendingWarnings) == 0 {
-		return nil
-	}
+	a.warningsMu.Lock()
+	defer a.warningsMu.Unlock()
 	warnings := a.pendingWarnings
 	a.pendingWarnings = nil
 	return warnings

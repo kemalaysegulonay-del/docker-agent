@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -81,7 +82,7 @@ func (d *bm25DB) createSchema() error {
 		d.metadataTable,
 		d.tablePrefix, d.metadataTable)
 
-	_, err := d.db.Exec(schema)
+	_, err := d.db.ExecContext(context.Background(), schema)
 	return err
 }
 
@@ -128,7 +129,8 @@ func (d *bm25DB) DeleteDocumentsByPath(ctx context.Context, sourcePath string) e
 }
 
 func (d *bm25DB) GetAllDocuments(ctx context.Context) ([]database.Document, error) {
-	query := fmt.Sprintf(`
+	query := fmt.Sprintf( //nolint:gosec // table name is internal, no user input
+		`
 	SELECT id, source_path, chunk_index, content, file_hash, created_at
 	FROM %s
 	`, d.docsTable)
@@ -158,7 +160,7 @@ func (d *bm25DB) GetFileMetadata(ctx context.Context, sourcePath string) (*datab
 		fmt.Sprintf("SELECT source_path, file_hash, last_indexed, chunk_count FROM %s WHERE source_path = ?", d.metadataTable),
 		sourcePath).Scan(&metadata.SourcePath, &metadata.FileHash, &metadata.LastIndexed, &metadata.ChunkCount)
 
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -169,7 +171,8 @@ func (d *bm25DB) GetFileMetadata(ctx context.Context, sourcePath string) (*datab
 }
 
 func (d *bm25DB) SetFileMetadata(ctx context.Context, metadata database.FileMetadata) error {
-	query := fmt.Sprintf(`
+	query := fmt.Sprintf( //nolint:gosec // table name is internal, values are bound parameters
+		`
 	INSERT INTO %s (source_path, file_hash, last_indexed, chunk_count)
 	VALUES (?, ?, CURRENT_TIMESTAMP, ?)
 	ON CONFLICT(source_path) DO UPDATE SET
@@ -184,7 +187,7 @@ func (d *bm25DB) SetFileMetadata(ctx context.Context, metadata database.FileMeta
 
 func (d *bm25DB) GetAllFileMetadata(ctx context.Context) ([]database.FileMetadata, error) {
 	rows, err := d.db.QueryContext(ctx,
-		"SELECT source_path, file_hash, last_indexed, chunk_count FROM "+d.metadataTable)
+		"SELECT source_path, file_hash, last_indexed, chunk_count FROM "+d.metadataTable) //nolint:gosec // table name is internal, no user input
 	if err != nil {
 		return nil, fmt.Errorf("failed to query file metadata: %w", err)
 	}
@@ -208,10 +211,7 @@ func (d *bm25DB) DeleteFileMetadata(ctx context.Context, sourcePath string) erro
 }
 
 func (d *bm25DB) Close() error {
-	if _, err := d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
-		slog.Warn("Failed to checkpoint WAL before close", "error", err)
-	}
-	return d.db.Close()
+	return sqliteutil.CheckpointAndClose(d.db)
 }
 
 // ensureDir creates the parent directory for a file path if it doesn't exist
@@ -221,8 +221,8 @@ func ensureDir(filePath string) error {
 		return nil
 	}
 
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return os.MkdirAll(dir, 0o755)
+	if _, err := os.Stat(dir); errors.Is(err, fs.ErrNotExist) {
+		return os.MkdirAll(dir, 0o700)
 	}
 
 	return nil

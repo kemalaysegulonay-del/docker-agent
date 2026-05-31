@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/docker/docker-agent/pkg/config/types"
 	"github.com/docker/docker-agent/pkg/js"
 	"github.com/docker/docker-agent/pkg/tools"
 )
@@ -16,6 +18,27 @@ import (
 // argsPlaceholderRegex matches ${args...} patterns to check if args are used.
 // This includes ${args}, ${args[N]}, ${args.join(...)}, ${args.length}, etc.
 var argsPlaceholderRegex = regexp.MustCompile(`\$\{args[^}]*\}`)
+
+// LookupCommand parses userInput as a /command invocation and returns the
+// matching command along with its trailing arguments. The boolean is false
+// when userInput doesn't start with '/' or doesn't match a configured
+// command. Callers that need both the resolved instruction and the original
+// command metadata (e.g. its target agent) typically call LookupCommand to
+// inspect the command before calling ResolveCommand.
+func LookupCommand(ctx context.Context, rt Runtime, userInput string) (cmd types.Command, rest string, ok bool) {
+	if !strings.HasPrefix(userInput, "/") {
+		return types.Command{}, "", false
+	}
+
+	head, tail, _ := strings.Cut(userInput, " ")
+	commandName := head[1:]
+
+	command, found := rt.CurrentAgentInfo(ctx).Commands[commandName]
+	if !found {
+		return types.Command{}, "", false
+	}
+	return command, tail, true
+}
 
 // ResolveCommand transforms a /command into its expanded instruction text.
 // It processes:
@@ -25,20 +48,26 @@ var argsPlaceholderRegex = regexp.MustCompile(`\$\{args[^}]*\}`)
 //   - ${args[0]}, ${args[1]}, etc. for positional arguments
 //   - ${args} or ${args.join(" ")} for all arguments
 //   - ${tool({...})} for tool calls
+//
+// For agent-switching commands (those declaring `agent: <name>` and no
+// instruction), ResolveCommand returns the trailing arguments verbatim so the
+// caller can forward them to the target sub-agent after switching. When the
+// command has no instruction and no arguments, the result is the empty
+// string, signalling "no message to send".
 func ResolveCommand(ctx context.Context, rt Runtime, userInput string) string {
-	if !strings.HasPrefix(userInput, "/") {
-		return userInput
-	}
-
-	cmd, rest, _ := strings.Cut(userInput, " ")
-	commandName := cmd[1:] // Remove leading "/"
-
-	command, found := rt.CurrentAgentInfo(ctx).Commands[commandName]
-	if !found {
+	command, rest, ok := LookupCommand(ctx, rt, userInput)
+	if !ok {
 		return userInput
 	}
 
 	instruction := command.Instruction
+
+	// Agent-only commands (no instruction): forward the trailing args verbatim
+	// so the target sub-agent receives the user's original prompt.
+	if instruction == "" {
+		return rest
+	}
+
 	args := tokenize(rest)
 
 	// Execute JavaScript expressions (${...} syntax) with args array
@@ -46,7 +75,7 @@ func ResolveCommand(ctx context.Context, rt Runtime, userInput string) string {
 	// which would be a security vulnerability (injection).
 	agentTools, err := rt.CurrentAgentTools(ctx)
 	if err != nil {
-		slog.Warn("Failed to get agent tools for JS expression execution", "error", err)
+		slog.WarnContext(ctx, "Failed to get agent tools for JS expression execution", "error", err)
 	} else {
 		evaluator := js.NewEvaluator(agentTools)
 		instruction = evaluator.Evaluate(ctx, instruction, args)
@@ -191,7 +220,7 @@ func executeToolCommands(ctx context.Context, rt Runtime, instruction string) st
 
 	agentTools, err := rt.CurrentAgentTools(ctx)
 	if err != nil {
-		slog.Warn("Failed to get agent tools for command execution", "error", err)
+		slog.WarnContext(ctx, "Failed to get agent tools for command execution", "error", err)
 		return instruction
 	}
 
@@ -202,8 +231,7 @@ func executeToolCommands(ctx context.Context, rt Runtime, instruction string) st
 
 	// Process in reverse order to maintain correct indices
 	result := instruction
-	for i := len(commands) - 1; i >= 0; i-- {
-		cmd := commands[i]
+	for _, cmd := range slices.Backward(commands) {
 		replacement := executeSingleToolCommand(ctx, toolMap, cmd.toolName, cmd.argsStr)
 		result = result[:cmd.start] + replacement + result[cmd.end:]
 	}
@@ -213,21 +241,21 @@ func executeToolCommands(ctx context.Context, rt Runtime, instruction string) st
 
 // executeSingleToolCommand executes a single tool command and returns the output.
 func executeSingleToolCommand(ctx context.Context, toolMap map[string]tools.Tool, toolName, argsStr string) string {
-	slog.Debug("Executing tool command", "tool", toolName, "args", argsStr)
+	slog.DebugContext(ctx, "Executing tool command", "tool", toolName, "args", argsStr)
 
 	tool, exists := toolMap[toolName]
 	if !exists {
-		slog.Warn("Tool not found for command execution", "tool", toolName)
+		slog.WarnContext(ctx, "Tool not found for command execution", "tool", toolName)
 		return "Error: tool '" + toolName + "' not found"
 	}
 	if tool.Handler == nil {
-		slog.Warn("Tool has no handler", "tool", toolName)
+		slog.WarnContext(ctx, "Tool has no handler", "tool", toolName)
 		return "Error: tool '" + toolName + "' has no handler"
 	}
 
 	argsJSON, err := json.Marshal(parseToolArgs(argsStr))
 	if err != nil {
-		slog.Warn("Failed to marshal tool arguments", "tool", toolName, "error", err)
+		slog.WarnContext(ctx, "Failed to marshal tool arguments", "tool", toolName, "error", err)
 		return "Error: failed to marshal arguments for '" + toolName + "'"
 	}
 
@@ -245,12 +273,12 @@ func executeSingleToolCommand(ctx context.Context, toolMap map[string]tools.Tool
 
 	result, err := tool.Handler(toolCtx, toolCall)
 	if err != nil {
-		slog.Warn("Tool execution failed", "tool", toolName, "error", err)
+		slog.WarnContext(ctx, "Tool execution failed", "tool", toolName, "error", err)
 		return "Error executing '" + toolName + "': " + err.Error()
 	}
 
 	output := strings.TrimSpace(result.Output)
-	slog.Debug("Tool command output", "tool", toolName, "output_length", len(output))
+	slog.DebugContext(ctx, "Tool command output", "tool", toolName, "output_length", len(output))
 	return output
 }
 

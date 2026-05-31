@@ -3,6 +3,7 @@ package agent
 import (
 	"time"
 
+	"github.com/docker/docker-agent/pkg/cache"
 	"github.com/docker/docker-agent/pkg/config/latest"
 	"github.com/docker/docker-agent/pkg/config/types"
 	"github.com/docker/docker-agent/pkg/model/provider"
@@ -109,6 +110,16 @@ func WithAddEnvironmentInfo(addEnvironmentInfo bool) Opt {
 	}
 }
 
+// WithRedactSecrets enables all three halves of the redact_secrets
+// feature: the pre_tool_use builtin (via ApplyAgentDefaults), the
+// runtime's before_llm_call message transform, and the dispatcher's
+// tool-output scrub.
+func WithRedactSecrets(redactSecrets bool) Opt {
+	return func(a *Agent) {
+		a.redactSecrets = redactSecrets
+	}
+}
+
 func WithAddDescriptionParameter(addDescriptionParameter bool) Opt {
 	return func(a *Agent) {
 		a.addDescriptionParameter = addDescriptionParameter
@@ -159,10 +170,21 @@ func WithCommands(commands types.Commands) Opt {
 	}
 }
 
+func WithHarness(harness *latest.HarnessConfig) Opt {
+	return func(a *Agent) {
+		if harness == nil {
+			a.harness = nil
+			return
+		}
+		cfg := *harness
+		a.harness = &cfg
+	}
+}
+
 func WithLoadTimeWarnings(warnings []string) Opt {
 	return func(a *Agent) {
 		for _, w := range warnings {
-			a.addToolWarning(w)
+			a.AddToolWarning(w)
 		}
 	}
 }
@@ -170,5 +192,12 @@ func WithLoadTimeWarnings(warnings []string) Opt {
 func WithHooks(hooks *latest.HooksConfig) Opt {
 	return func(a *Agent) {
 		a.hooks = hooks
+	}
+}
+
+// WithCache attaches a response cache to the agent. Pass nil to disable.
+func WithCache(c *cache.Cache) Opt {
+	return func(a *Agent) {
+		a.cache = c
 	}
 }

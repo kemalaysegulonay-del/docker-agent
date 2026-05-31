@@ -46,12 +46,12 @@ func (t *bearerTokenTransport) RoundTrip(req *http.Request) (*http.Response, err
 
 func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider, opts ...options.Opt) (*Client, error) {
 	if cfg == nil {
-		slog.Error("Bedrock client creation failed", "error", "model configuration is required")
+		slog.ErrorContext(ctx, "Bedrock client creation failed", "error", "model configuration is required")
 		return nil, errors.New("model configuration is required")
 	}
 
 	if cfg.Provider != "amazon-bedrock" {
-		slog.Error("Bedrock client creation failed", "error", "model type must be 'amazon-bedrock'", "actual_type", cfg.Provider)
+		slog.ErrorContext(ctx, "Bedrock client creation failed", "error", "model type must be 'amazon-bedrock'", "actual_type", cfg.Provider)
 		return nil, errors.New("model type must be 'amazon-bedrock'")
 	}
 
@@ -70,7 +70,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	if cfg.TokenKey != "" {
 		bearerToken, _ = env.Get(ctx, cfg.TokenKey)
 		if bearerToken == "" {
-			slog.Debug("Bedrock token_key configured but env var is empty, falling back to AWS credential chain",
+			slog.DebugContext(ctx, "Bedrock token_key configured but env var is empty, falling back to AWS credential chain",
 				"token_key", cfg.TokenKey)
 		}
 	} else {
@@ -80,7 +80,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 	// Build AWS config using default credential chain
 	awsCfg, err := buildAWSConfig(ctx, cfg, env)
 	if err != nil {
-		slog.Error("Failed to build AWS config", "error", err)
+		slog.ErrorContext(ctx, "Failed to build AWS config", "error", err)
 		return nil, fmt.Errorf("failed to build AWS config: %w", err)
 	}
 
@@ -96,7 +96,7 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 	// If bearer token is set, use it instead of SigV4
 	if bearerToken != "" {
-		slog.Debug("Bedrock using bearer token authentication")
+		slog.DebugContext(ctx, "Bedrock using bearer token authentication")
 		clientOpts = append(clientOpts, func(o *bedrockruntime.Options) {
 			// Use anonymous credentials to skip SigV4 signing
 			o.Credentials = aws.AnonymousCredentials{}
@@ -114,9 +114,9 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 
 	// Detect prompt caching capability at init time for efficiency.
 	// Uses models.dev cache pricing as proxy for capability detection.
-	cachingSupported := detectCachingSupport(ctx, cfg.Model)
+	cachingSupported := detectCachingSupport(ctx, cfg.Model, globalOptions.ModelsDevStore())
 
-	slog.Debug("Bedrock client created successfully",
+	slog.DebugContext(ctx, "Bedrock client created successfully",
 		"model", cfg.Model,
 		"region", awsCfg.Region,
 		"caching_supported", cachingSupported)
@@ -135,18 +135,16 @@ func NewClient(ctx context.Context, cfg *latest.ModelConfig, env environment.Pro
 // detectCachingSupport checks if a model supports prompt caching using models.dev data.
 // Models with non-zero CacheRead/CacheWrite costs support prompt caching.
 // Returns false on lookup failure (safe default for unsupported models).
-func detectCachingSupport(ctx context.Context, model string) bool {
-	store, err := modelsdev.NewStore()
-	if err != nil {
-		slog.Debug("Bedrock models store unavailable, prompt caching disabled", "error", err)
+func detectCachingSupport(ctx context.Context, model string, store *modelsdev.Store) bool {
+	if store == nil {
 		return false
 	}
 
-	modelID := "amazon-bedrock/" + model
-	m, err := store.GetModel(ctx, modelID)
+	id := modelsdev.NewID("amazon-bedrock", model)
+	m, err := store.GetModel(ctx, id)
 	if err != nil {
-		slog.Debug("Bedrock prompt caching disabled: model not found in models.dev",
-			"model_id", modelID, "error", err)
+		slog.DebugContext(ctx, "Bedrock prompt caching disabled: model not found in models.dev",
+			"model_id", id.String(), "error", err)
 		return false
 	}
 
@@ -194,7 +192,7 @@ func buildAWSConfig(ctx context.Context, cfg *latest.ModelConfig, env environmen
 			}
 		})
 		awsCfg.Credentials = aws.NewCredentialsCache(creds)
-		slog.Debug("Bedrock using assumed role", "role_arn", roleARN)
+		slog.DebugContext(ctx, "Bedrock using assumed role", "role_arn", roleARN)
 	}
 
 	return awsCfg, nil
@@ -205,7 +203,7 @@ func (c *Client) CreateChatCompletionStream(
 	messages []chat.Message,
 	requestTools []tools.Tool,
 ) (chat.MessageStream, error) {
-	slog.Debug("Creating Bedrock chat completion stream",
+	slog.DebugContext(ctx, "Creating Bedrock chat completion stream",
 		"model", c.ModelConfig.Model,
 		"message_count", len(messages),
 		"tool_count", len(requestTools))
@@ -215,12 +213,12 @@ func (c *Client) CreateChatCompletionStream(
 	}
 
 	// Build Converse input
-	input := c.buildConverseStreamInput(messages, requestTools)
+	input := c.buildConverseStreamInput(ctx, messages, requestTools)
 
 	// Call ConverseStream
 	output, err := c.bedrockClient.ConverseStream(ctx, input)
 	if err != nil {
-		slog.Error("Bedrock ConverseStream failed", "error", err)
+		slog.ErrorContext(ctx, "Bedrock ConverseStream failed", "error", err)
 		return nil, wrapBedrockError(fmt.Errorf("bedrock converse stream failed: %w", err))
 	}
 
@@ -228,7 +226,7 @@ func (c *Client) CreateChatCompletionStream(
 	return newStreamAdapter(output.GetStream(), c.ModelConfig.Model, trackUsage), nil
 }
 
-func (c *Client) buildConverseStreamInput(messages []chat.Message, requestTools []tools.Tool) *bedrockruntime.ConverseStreamInput {
+func (c *Client) buildConverseStreamInput(ctx context.Context, messages []chat.Message, requestTools []tools.Tool) *bedrockruntime.ConverseStreamInput {
 	input := &bedrockruntime.ConverseStreamInput{
 		ModelId: aws.String(c.ModelConfig.Model),
 	}
@@ -236,7 +234,7 @@ func (c *Client) buildConverseStreamInput(messages []chat.Message, requestTools 
 	enableCaching := c.promptCachingEnabled()
 
 	// Convert and set messages (excluding system)
-	input.Messages, input.System = convertMessages(messages, enableCaching)
+	input.Messages, input.System = convertMessages(ctx, messages, c.ID(), c.ModelOptions.ModelsDevStore(), enableCaching)
 
 	// Compute thinking fields first — its presence drives the inference config.
 	additionalFields := c.buildAdditionalModelRequestFields()
@@ -259,7 +257,7 @@ func (c *Client) buildInferenceConfig(thinkingEnabled bool) *types.InferenceConf
 	cfg := &types.InferenceConfiguration{}
 
 	if c.ModelConfig.MaxTokens != nil && *c.ModelConfig.MaxTokens > 0 {
-		cfg.MaxTokens = aws.Int32(int32(*c.ModelConfig.MaxTokens))
+		cfg.MaxTokens = aws.Int32(int32(*c.ModelConfig.MaxTokens)) //nolint:gosec // user-configured token count; realistic values fit in int32
 	}
 
 	// Temperature and TopP cannot be set when extended thinking is enabled

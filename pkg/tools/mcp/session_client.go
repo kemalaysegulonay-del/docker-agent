@@ -22,6 +22,7 @@ type sessionClient struct {
 	toolListChangedHandler   func()
 	promptListChangedHandler func()
 	elicitationHandler       tools.ElicitationHandler
+	samplingHandler          tools.SamplingHandler
 	oauthSuccessHandler      func()
 	mu                       sync.RWMutex
 }
@@ -128,7 +129,7 @@ func (c *sessionClient) GetPrompt(ctx context.Context, request *gomcp.GetPromptP
 // server to the registered handler. It is used as the gomcp ElicitationHandler
 // callback for both stdio and remote clients.
 func (c *sessionClient) handleElicitationRequest(ctx context.Context, req *gomcp.ElicitRequest) (*gomcp.ElicitResult, error) {
-	slog.Debug("Received elicitation request from MCP server", "message", req.Params.Message)
+	slog.DebugContext(ctx, "Received elicitation request from MCP server", "message", req.Params.Message)
 
 	c.mu.RLock()
 	handler := c.elicitationHandler
@@ -157,16 +158,57 @@ func (c *sessionClient) SetElicitationHandler(handler tools.ElicitationHandler) 
 	c.mu.Unlock()
 }
 
+// handleSamplingRequest forwards incoming sampling/createMessage requests
+// from the MCP server to the registered handler. It is used as the gomcp
+// CreateMessageHandler callback for both stdio and remote clients.
+func (c *sessionClient) handleSamplingRequest(ctx context.Context, req *gomcp.CreateMessageRequest) (*gomcp.CreateMessageResult, error) {
+	slog.DebugContext(ctx, "Received sampling request from MCP server", "messages", len(req.Params.Messages))
+
+	c.mu.RLock()
+	handler := c.samplingHandler
+	c.mu.RUnlock()
+
+	if handler == nil {
+		return nil, errors.New("no sampling handler configured")
+	}
+
+	result, err := handler(ctx, req.Params)
+	if err != nil {
+		return nil, fmt.Errorf("sampling failed: %w", err)
+	}
+
+	return result, nil
+}
+
+// SetSamplingHandler sets the handler that processes sampling requests
+// from the MCP server.
+func (c *sessionClient) SetSamplingHandler(handler tools.SamplingHandler) {
+	c.mu.Lock()
+	c.samplingHandler = handler
+	c.mu.Unlock()
+}
+
 // requestElicitation invokes the registered elicitation handler directly.
 // This is used by the OAuth transport to trigger elicitation outside of
 // the normal MCP request flow.
+//
+// When no handler is wired up (typically because the OAuth flow ran before
+// the runtime had a chance to attach its elicitation bridge — e.g. during
+// a startup probe whose context lost the WithoutInteractivePrompts marker),
+// we surface the recognisable AuthorizationRequiredError sentinel rather
+// than a bare "no elicitation handler configured" error. That keeps the
+// failure mode of "client side not ready yet" identical to the explicit
+// non-interactive deferral: the toolset is flagged as needing auth and
+// silently retried on the next conversation turn, instead of bubbling a
+// confusing message up to the user.
 func (c *sessionClient) requestElicitation(ctx context.Context, req *gomcp.ElicitParams) (tools.ElicitationResult, error) {
 	c.mu.RLock()
 	handler := c.elicitationHandler
 	c.mu.RUnlock()
 
 	if handler == nil {
-		return tools.ElicitationResult{}, errors.New("no elicitation handler configured")
+		slog.DebugContext(ctx, "OAuth flow requested elicitation before the runtime wired up a handler; deferring")
+		return tools.ElicitationResult{}, &AuthorizationRequiredError{}
 	}
 
 	return handler(ctx, req)
@@ -193,3 +235,9 @@ func (c *sessionClient) oauthSuccess() {
 // SetManagedOAuth is a no-op at the session level. The remoteMCPClient
 // overrides this to store the managed flag for its OAuth transport.
 func (c *sessionClient) SetManagedOAuth(bool) {}
+
+// SetUnmanagedOAuthRedirectURI is a no-op at the session level. The
+// remoteMCPClient overrides this to store the URI for its OAuth transport.
+// Stdio MCP clients never run OAuth (they have no HTTP transport to
+// authenticate), so the URI is ignored there too.
+func (c *sessionClient) SetUnmanagedOAuthRedirectURI(string) {}

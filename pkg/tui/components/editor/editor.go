@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/docker/docker-agent/pkg/tui/components/editor/completions"
 	"github.com/docker/docker-agent/pkg/tui/core"
 	"github.com/docker/docker-agent/pkg/tui/core/layout"
+	"github.com/docker/docker-agent/pkg/tui/internal/termfeatures"
 	"github.com/docker/docker-agent/pkg/tui/messages"
 	"github.com/docker/docker-agent/pkg/tui/styles"
 )
@@ -194,7 +196,7 @@ func New(hist *history.History, opts ...Option) Editor {
 		textarea:                      ta,
 		searchInput:                   si,
 		hist:                          hist,
-		keyboardEnhancementsSupported: false,
+		keyboardEnhancementsSupported: termfeatures.SupportsModifiedEnter(os.Getenv),
 		banner:                        newAttachmentBanner(),
 	}
 
@@ -305,7 +307,7 @@ func (e *editor) applySuggestionOverlay(view string) string {
 		// Cursor is on the line after the last content line.
 		// Find the first empty line after content.
 		contentLine := -1
-		for i := len(lines) - 1; i >= 0; i-- {
+		for i := range slices.Backward(lines) {
 			if lineHasContent(lines[i], e.textarea.Prompt) {
 				contentLine = i
 				break
@@ -329,7 +331,7 @@ func (e *editor) applySuggestionOverlay(view string) string {
 
 		// First, find the last visual line with content
 		lastContentLine := -1
-		for i := len(lines) - 1; i >= 0; i-- {
+		for i := range slices.Backward(lines) {
 			if lineHasContent(lines[i], e.textarea.Prompt) {
 				lastContentLine = i
 				break
@@ -565,10 +567,32 @@ func (e *editor) resetAndSend(content string) tea.Cmd {
 	e.tryAddFileRef(e.pendingFileRef)
 	e.pendingFileRef = ""
 	attachments := e.collectAttachments(content)
+
+	var finalAttachments []messages.Attachment
+	var pastes []messages.Attachment
+
+	for _, att := range attachments {
+		if att.Content != "" && strings.HasPrefix(att.Name, "paste-") {
+			pastes = append(pastes, att)
+		} else {
+			finalAttachments = append(finalAttachments, att)
+		}
+	}
+
+	// Sort pastes by name length descending to avoid partial matches
+	// e.g., replacing @paste-1 before @paste-10 would corrupt @paste-10.
+	slices.SortFunc(pastes, func(a, b messages.Attachment) int {
+		return len(b.Name) - len(a.Name)
+	})
+
+	for _, att := range pastes {
+		content = strings.ReplaceAll(content, "@"+att.Name, att.Content)
+	}
+
 	e.textarea.Reset()
 	e.userTyped = false
 	e.clearSuggestion()
-	return core.CmdHandler(messages.SendMsg{Content: content, Attachments: attachments})
+	return core.CmdHandler(messages.SendMsg{Content: content, Attachments: finalAttachments})
 }
 
 // configureNewlineKeybinding sets up the appropriate newline keybinding
@@ -611,7 +635,7 @@ func (e *editor) Update(msg tea.Msg) (layout.Model, tea.Cmd) {
 		}
 	case tea.KeyboardEnhancementsMsg:
 		// Track keyboard enhancement support and configure newline keybinding accordingly
-		e.keyboardEnhancementsSupported = msg.Flags != 0
+		e.keyboardEnhancementsSupported = msg.Flags != 0 || termfeatures.SupportsModifiedEnter(os.Getenv)
 		e.configureNewlineKeybinding()
 		return e, nil
 	case messages.ThemeChangedMsg:
@@ -1506,7 +1530,7 @@ func (e *editor) removeLastNAttachments(n int) {
 		if !e.attachments[i].isTemp {
 			// Strip the placeholder text ("@/path/file.png ") that AttachFile inserted
 			value = strings.Replace(value, e.attachments[i].placeholder+" ", "", 1)
-			e.attachments = append(e.attachments[:i], e.attachments[i+1:]...)
+			e.attachments = slices.Delete(e.attachments, i, i+1)
 			removed++
 		}
 	}

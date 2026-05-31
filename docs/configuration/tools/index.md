@@ -15,19 +15,24 @@ Built-in tools are included with docker-agent and require no external dependenci
 | Type | Description | Page |
 | --- | --- | --- |
 | `filesystem` | Read, write, list, search, navigate | [Filesystem]({{ '/tools/filesystem/' | relative_url }}) |
-| `shell` | Execute shell commands | [Shell]({{ '/tools/shell/' | relative_url }}) |
+| `shell` | Execute shell commands (sync + background jobs) | [Shell]({{ '/tools/shell/' | relative_url }}) |
 | `think` | Reasoning scratchpad | [Think]({{ '/tools/think/' | relative_url }}) |
 | `todo` | Task list management | [Todo]({{ '/tools/todo/' | relative_url }}) |
+| `tasks` | Persistent task database shared across sessions | [Tasks]({{ '/tools/tasks/' | relative_url }}) |
 | `memory` | Persistent key-value storage (SQLite) | [Memory]({{ '/tools/memory/' | relative_url }}) |
-| `fetch` | HTTP requests | [Fetch]({{ '/tools/fetch/' | relative_url }}) |
+| `fetch` | HTTP `GET` requests with text/markdown/html output | [Fetch]({{ '/tools/fetch/' | relative_url }}) |
 | `script` | Custom shell scripts as tools | [Script]({{ '/tools/script/' | relative_url }}) |
 | `lsp` | Language Server Protocol integration | [LSP]({{ '/tools/lsp/' | relative_url }}) |
 | `api` | Custom HTTP API tools | [API]({{ '/tools/api/' | relative_url }}) |
+| `openapi` | Import every operation of an OpenAPI 3.x document as tools | [OpenAPI]({{ '/tools/openapi/' | relative_url }}) |
+| `rag` | Retrieval-augmented generation over indexed sources | [RAG]({{ '/tools/rag/' | relative_url }}) |
+| `model_picker` | Let the agent pick between several models per turn | [Model Picker]({{ '/tools/model-picker/' | relative_url }}) |
 | `user_prompt` | Interactive user input | [User Prompt]({{ '/tools/user-prompt/' | relative_url }}) |
 | `transfer_task` | Delegate to sub-agents (auto-enabled) | [Transfer Task]({{ '/tools/transfer-task/' | relative_url }}) |
 | `background_agents` | Parallel sub-agent dispatch | [Background Agents]({{ '/tools/background-agents/' | relative_url }}) |
-| `handoff` | A2A remote agent delegation | [Handoff]({{ '/tools/handoff/' | relative_url }}) |
+| `handoff` | Local conversation handoff to another agent in the same config (auto-enabled by `handoffs:`) | [Handoff]({{ '/tools/handoff/' | relative_url }}) |
 | `a2a` | A2A remote agent connection | [A2A]({{ '/tools/a2a/' | relative_url }}) |
+| `mcp_catalog` | Discover and activate remote MCP servers from the Docker MCP Catalog on demand | [MCP Catalog]({{ '/tools/mcp-catalog/' | relative_url }}) |
 
 **Example:**
 
@@ -43,7 +48,13 @@ toolsets:
 
 ## MCP Tools
 
-Extend agents with external tools via the [Model Context Protocol](https://modelcontextprotocol.io/).
+Extend agents with external tools via the [Model Context Protocol](https://modelcontextprotocol.io/). For a standalone overview of the `mcp` toolset see the [MCP tool page]({{ '/tools/mcp/' | relative_url }}).
+
+<div class="callout callout-tip" markdown="1">
+<div class="callout-title">Reusable MCP definitions
+</div>
+  <p>Repeated MCP server definitions can be hoisted into the top-level <code>mcps:</code> section and referenced by name with <code>{type: mcp, ref: &lt;name&gt;}</code>. See <a href="{{ '/configuration/overview/#reusable-mcp-servers-mcps' | relative_url }}">Reusable MCP Servers</a>.</p>
+</div>
 
 ### Docker MCP (Recommended)
 
@@ -65,6 +76,7 @@ Browse available tools at the [Docker MCP Catalog](https://hub.docker.com/search
 | `tools`       | array  | Optional: only expose these tools                                |
 | `instruction` | string | Custom instructions injected into the agent's context            |
 | `config`      | any    | MCP server-specific configuration (passed during initialization) |
+| `working_dir` | string | Working directory for the MCP gateway subprocess. Only applies when the catalog entry runs as a local process (not remote). Relative paths are resolved against the agent's working directory. Supports `~` and shell-style `$VAR`/`${VAR}` expansion ([details]({{ '/configuration/overview/#variable-expansion-in-config-fields' | relative_url }})). |
 
 ### Local MCP (stdio)
 
@@ -86,6 +98,7 @@ toolsets:
 | `args` | array | Command arguments |
 | `tools` | array | Optional: only expose these tools |
 | `env` | object | Environment variables (key-value pairs) |
+| `working_dir` | string | Working directory for the MCP server process. Relative paths are resolved against the agent's working directory. Defaults to the agent's working directory when omitted. Supports `~` and shell-style `$VAR`/`${VAR}` expansion ([details]({{ '/configuration/overview/#variable-expansion-in-config-fields' | relative_url }})). |
 | `instruction` | string | Custom instructions injected into the agent's context |
 | `version` | string | Package reference for [auto-installing](#auto-installing-tools) the command binary |
 
@@ -101,14 +114,17 @@ toolsets:
       transport_type: "sse"
       headers:
         Authorization: "Bearer your-token"
+    # Optional: allow OAuth helper requests to reach private/internal IPs.
+    allow_private_ips: true
     tools: ["search_web", "fetch_url"]
 ```
 
-| Property                | Type   | Description                       |
-| ----------------------- | ------ | --------------------------------- |
-| `remote.url`            | string | Base URL of the MCP server        |
-| `remote.transport_type` | string | `sse` or `streamable`             |
-| `remote.headers`        | object | HTTP headers (typically for auth) |
+| Property                | Type    | Description                                                                                                           |
+| ----------------------- | ------- | --------------------------------------------------------------------------------------------------------------------- |
+| `remote.url`            | string  | Base URL of the MCP server                                                                                            |
+| `remote.transport_type` | string  | `sse` or `streamable`                                                                                                 |
+| `remote.headers`        | object  | HTTP headers (typically for auth)                                                                                     |
+| `allow_private_ips`     | boolean | Permit remote MCP OAuth helper requests to dial non-public IP addresses. Use only for trusted internal servers.        |
 
 ## Auto-Installing Tools
 
@@ -177,10 +193,145 @@ export DOCKER_AGENT_AUTO_INSTALL=false
 Installed binaries are placed in `~/.cagent/tools/bin/` and cached so they are only downloaded once.
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Auto-install supports both Go packages (via <code>go install</code>) and GitHub release binaries (via archive download). The aqua registry metadata determines which method is used.</p>
 </div>
+
+## Toolset Lifecycle
+
+Long-running toolsets — local MCP servers (stdio), remote MCP servers (SSE / streamable HTTP), and LSP servers — are managed by a single supervisor that can auto-reconnect them when they crash, time out, or drop their session. The `lifecycle` block on the toolset lets you tune that supervisor per toolset. It applies to every `type: mcp` and `type: lsp` toolset.
+
+The simplest knob is `profile`, which picks a preset:
+
+| Profile | Auto-restart | Use case |
+| --- | --- | --- |
+| `resilient` | Yes | Default. Exponential backoff on disconnect; the agent keeps running if the toolset is unavailable. Matches the historical docker-agent behaviour. |
+| `strict` | No | Fail-fast. Marks the toolset as required. Intended for CI / headless runs where a missing dependency should be a hard error. |
+| `best-effort` | No | Single attempt, no retries. Good for experimental MCPs whose flakiness should not amplify into a restart loop. |
+
+```yaml
+toolsets:
+  - type: mcp
+    ref: docker:duckduckgo
+    lifecycle:
+      profile: resilient   # default; shown here for clarity
+
+  - type: lsp
+    command: gopls
+    file_types: [".go"]
+    lifecycle:
+      profile: strict
+
+  - type: mcp
+    ref: docker:openbnb-airbnb
+    lifecycle:
+      profile: best-effort
+```
+
+### Tuning the defaults
+
+Any field set on `lifecycle` overrides the profile preset, so you can mix-and-match: pick a profile and only override the knobs you care about.
+
+```yaml
+toolsets:
+  - type: mcp
+    command: ["docker", "mcp", "gateway"]
+    lifecycle:
+      profile: resilient
+      max_restarts: 10        # keep trying longer than the default of 5
+      backoff:
+        initial: 500ms
+        max: 1m
+        multiplier: 2
+        jitter: 0.2           # 20% random offset to avoid thundering-herd retries
+```
+
+| Property | Type | Description |
+| --- | --- | --- |
+| `profile` | string | One of `resilient` (default), `strict`, `best-effort`. Picks defaults for every other field. |
+| `restart` | string | When the supervisor should reconnect after a disconnect: `never`, `on_failure` (default), or `always`. |
+| `max_restarts` | int | Maximum consecutive restart attempts before the toolset is marked `Failed`. `0` uses the profile default (5); `-1` means unlimited. |
+| `backoff.initial` | duration | First wait between attempts (Go duration: `500ms`, `1s`, …). Default: `1s`. |
+| `backoff.max` | duration | Cap on the wait between attempts. Default: `32s`. |
+| `backoff.multiplier` | number | Multiplier applied each attempt. Default: `2`. |
+| `backoff.jitter` | number | Fraction (0..1) of the computed delay applied as a uniform random offset. `0` disables jitter (default). |
+| `required` | boolean | Marks the toolset as critical. Today this is informational; a future eager-startup phase will refuse to start the agent when a required toolset cannot reach Ready. Defaults to `true` under `strict`, `false` otherwise. |
+| `startup_timeout` | duration | Cap on the initial connect+initialize duration. Today this is informational; the eager-startup phase that enforces it ships in a follow-up. |
+| `call_timeout` | duration | Documented per-call timeout. Informational; the runtime currently uses the caller's context for cancellation. |
+
+<div class="callout callout-info" markdown="1">
+<div class="callout-title"><code>required</code> and <code>startup_timeout</code> are not yet enforced
+</div>
+  <p>The schema validates these fields and the supervisor stores them, but no code path acts on them yet. They are documented now so config files written today keep working when the planned eager-startup phase lands. Picking the <code>strict</code> profile is forward-compatible — it will start enforcing <code>required=true</code> automatically.</p>
+</div>
+
+### Inspecting and restarting toolsets at runtime
+
+The TUI exposes the supervisor through two slash commands:
+
+- `/tools` — the unified tools dialog. Its top section lists every toolset on the current agent with its lifecycle state (`Stopped`, `Starting`, `Ready`, `Degraded`, `Restarting`, `Failed`), restart count, and last error; its bottom section lists every tool the agent can call, grouped by category. Use this to answer both "what can the agent do?" and "is anything degraded?" with one command.
+- `/toolset-restart <name>` — force the supervisor to reconnect the named toolset. Useful after completing OAuth, when a remote MCP server has been redeployed, or when an LSP like `gopls` is stuck.
+
+See the [TUI reference]({{ '/features/tui/' | relative_url }}) for the full list of slash commands.
+
+## TOON-Encoded Tool Outputs
+
+Many MCP servers return verbose JSON responses that consume a lot of context budget. The `toon` field on a toolset transparently re-encodes matching tools' JSON output as [TOON](https://github.com/alpkeskin/gotoon) — a compact, model-friendly key/value format — before the result is shown to the model.
+
+```yaml
+toolsets:
+  - type: mcp
+    ref: docker:github-official
+    toon: ".*"          # toonify every tool from this MCP server
+  - type: mcp
+    command: my-server
+    toon: "list_.*,get_.*" # only toonify list_/get_ tools
+```
+
+| Property | Type   | Description |
+| -------- | ------ | ----------- |
+| `toon`   | string | Comma-delimited list of regular expressions matching tool names whose JSON output should be re-encoded as TOON. Non-JSON outputs and non-matching tools are passed through untouched. |
+
+When a tool's output is not valid JSON, it is returned unchanged — TOON encoding is best-effort and never breaks tools that emit plain text.
+
+<div class="callout callout-info" markdown="1">
+<div class="callout-title">When to use TOON
+</div>
+  <p>TOON typically yields 30-60% smaller payloads than equivalent JSON for MCP tools that return arrays of records (issue lists, search results, file listings, …). It works best when the schema is regular; one-off responses with deeply nested or heterogeneous shapes may benefit less.</p>
+</div>
+
+## Per-Toolset Model Routing
+
+The `model` field on a toolset overrides which LLM is invoked for the **next turn** after a tool from that toolset returns — letting you process simple tool results (file reads, knowledge-base lookups, shell stdout) with a cheaper or faster model while keeping the agent's primary model for reasoning.
+
+```yaml
+models:
+  primary:
+    provider: anthropic
+    model: claude-sonnet-4-5
+  fast:
+    provider: anthropic
+    model: claude-haiku-4-5
+
+agents:
+  root:
+    model: primary
+    toolsets:
+      - type: filesystem
+        model: fast            # process file reads with the fast model
+      - type: shell
+        model: fast            # ditto for shell stdout
+      - type: mcp
+        ref: docker:github-official
+        model: openai/gpt-4o-mini  # inline provider/model also works
+```
+
+| Property | Type   | Description |
+| -------- | ------ | ----------- |
+| `model`  | string | Model used for the LLM turn that processes tool results from this toolset. Either a name from the `models:` section or an inline `provider/model` (e.g. `openai/gpt-4o-mini`). The override is **one-shot**: subsequent turns return to the agent's primary model. |
+
+When multiple tool calls in a single turn come from toolsets with different `model` overrides, the runtime picks the override of the **first** tool call that has one set. See [`examples/per_tool_model_routing.yaml`](https://github.com/docker/docker-agent/blob/main/examples/per_tool_model_routing.yaml) for a complete configuration.
 
 ## Tool Filtering
 
@@ -198,7 +349,7 @@ toolsets:
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Filtering tools improves agent performance — fewer tools means less confusion for the model about which tool to use.</p>
 </div>
@@ -248,7 +399,7 @@ toolsets:
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Full-featured developer assistant
     instruction: You are an expert developer.
     toolsets:
@@ -269,10 +420,10 @@ agents:
         shell:
           run_tests:
             description: Run the test suite
-            cmd: mise test
+            cmd: task test
           lint:
             description: Run the linter
-            cmd: mise lint
+            cmd: task lint
       # Custom API tool
       - type: api
         api_config:
@@ -296,7 +447,7 @@ agents:
 ```
 
 <div class="callout callout-warning" markdown="1">
-<div class="callout-title">⚠️ Toolset Order Matters
+<div class="callout-title">Toolset Order Matters
 </div>
   <p>If multiple toolsets provide a tool with the same name, the first one wins. Order your toolsets intentionally.</p>
 </div>

@@ -13,7 +13,7 @@ _Use docker-agent as a Go library to embed AI agents in your applications._
 docker-agent can be used as a Go library, allowing you to build AI agents directly into your Go applications. This gives you full programmatic control over agent creation, tool integration, and execution.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Import Path
+<div class="callout-title">Import Path
 </div>
 <pre><code class="language-go">import "github.com/docker/docker-agent/pkg/..."</code></pre>
 </div>
@@ -264,7 +264,7 @@ func createAgentWithBuiltinTools(llm provider.Provider) *agent.Agent {
         agent.WithModel(llm),
         agent.WithToolSets(
             // Shell tool for running commands
-            builtin.NewShellTool(os.Environ(), rtConfig, nil),
+            builtin.NewShellTool(os.Environ(), rtConfig),
             // Filesystem tools
             builtin.NewFilesystemTool(rtConfig.Config.WorkingDir),
             // Think tool for reasoning
@@ -294,7 +294,7 @@ openaiClient, _ := openai.NewClient(ctx, &latest.ModelConfig{
 // Anthropic
 anthropicClient, _ := anthropic.NewClient(ctx, &latest.ModelConfig{
     Provider: "anthropic",
-    Model:    "claude-sonnet-4-0",
+    Model:    "claude-sonnet-4-5",
 }, env)
 
 // Google Gemini

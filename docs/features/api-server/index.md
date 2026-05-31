@@ -39,24 +39,28 @@ All endpoints are under the `/api` prefix.
 
 ### Sessions
 
-| Method   | Path                                | Description                                         |
-| -------- | ----------------------------------- | --------------------------------------------------- |
-| `GET`    | `/api/sessions`                     | List all sessions                                   |
-| `POST`   | `/api/sessions`                     | Create a new session                                |
-| `GET`    | `/api/sessions/:id`                 | Get a session by ID (messages, tokens, permissions) |
-| `DELETE` | `/api/sessions/:id`                 | Delete a session                                    |
-| `PATCH`  | `/api/sessions/:id/title`           | Update session title                                |
-| `PATCH`  | `/api/sessions/:id/permissions`     | Update session permissions                          |
-| `POST`   | `/api/sessions/:id/resume`          | Resume a paused session (after tool confirmation)   |
-| `POST`   | `/api/sessions/:id/tools/toggle`    | Toggle auto-approve (YOLO) mode                     |
-| `POST`   | `/api/sessions/:id/elicitation`     | Respond to an MCP tool elicitation request          |
+| Method   | Path                                | Description                                             |
+| -------- | ----------------------------------- | ------------------------------------------------------- |
+| `GET`    | `/api/sessions`                     | List all sessions                                       |
+| `POST`   | `/api/sessions`                     | Create a new session                                    |
+| `GET`    | `/api/sessions/:id`                 | Get a session by ID (messages, tokens, permissions)     |
+| `DELETE` | `/api/sessions/:id`                 | Delete a session                                        |
+| `PATCH`  | `/api/sessions/:id/title`           | Update session title                                    |
+| `PATCH`  | `/api/sessions/:id/permissions`     | Update session permissions                              |
+| `POST`   | `/api/sessions/:id/resume`          | Resume a paused session (after tool confirmation)       |
+| `POST`   | `/api/sessions/:id/tools/toggle`    | Toggle auto-approve (YOLO) mode                         |
+| `POST`   | `/api/sessions/:id/elicitation`     | Respond to an MCP tool elicitation request              |
+| `POST`   | `/api/sessions/:id/steer`           | Inject messages into a running turn (pre-empts current) |
+| `POST`   | `/api/sessions/:id/followup`        | Enqueue messages to run after the current turn finishes |
+| `GET`    | `/api/sessions/:id/models`          | List available models for the session's current agent   |
 
 ### Agent Execution
 
-| Method | Path                                   | Description                                   |
-| ------ | -------------------------------------- | --------------------------------------------- |
-| `POST` | `/api/sessions/:id/agent/:agent`       | Run the root agent for a session (SSE stream) |
-| `POST` | `/api/sessions/:id/agent/:agent/:name` | Run a specific named agent (SSE stream)       |
+| Method | Path                                       | Description                                                                          |
+| ------ | ------------------------------------------ | ------------------------------------------------------------------------------------ |
+| `POST` | `/api/sessions/:id/agent/:agent`           | Run the root agent for a session (SSE stream)                                        |
+| `POST` | `/api/sessions/:id/agent/:agent/:name`     | Run a specific named agent (SSE stream)                                              |
+| `GET`  | `/api/agents/:id/:agent_name/tools/count`  | Count tools currently available to `:agent_name` (accounts for deferred toolsets).   |
 
 **Path parameters:**
 
@@ -71,19 +75,19 @@ All endpoints are under the `/api` prefix.
 # Run the root agent:
 curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/my-assistant \
   -H "Content-Type: application/json" \
-  -d '[{"role": "user", "content": "Hello!"}]'
+  -d '{"messages":[{"role": "user", "content": "Hello!"}]}'
 
 # Multi-agent config: team.yaml (defines agents: root, coder, reviewer)
 # Start: docker agent serve api team.yaml
 # Run the root agent:
 curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/team \
   -H "Content-Type: application/json" \
-  -d '[{"role": "user", "content": "Review this PR"}]'
+  -d '{"messages":[{"role": "user", "content": "Review this PR"}]}'
 
 # Run a specific sub-agent (reviewer):
 curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/team/reviewer \
   -H "Content-Type: application/json" \
-  -d '[{"role": "user", "content": "Review this PR"}]'
+  -d '{"messages":[{"role": "user", "content": "Review this PR"}]}'
 ```
 
 ### Health
@@ -92,16 +96,27 @@ curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/team/reviewer \
 | ------ | ----------- | ----------------------------------------- |
 | `GET`  | `/api/ping` | Health check — returns `{"status": "ok"}` |
 
+### OAuth
+
+| Method | Path                     | Description                                                                                                                                                                                                                                          |
+| ------ | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `POST` | `/api/mcp-oauth/callback` | Deliver an OAuth deeplink callback to a pending unmanaged OAuth flow. Success path: `?state=<state>&code=<code>`; authorization-server error path: `?state=<state>&error=<error>&error_description=<desc>`. Returns 400 if `state` is missing or neither `code` nor `error` is provided; 404 if no flow is awaiting that `state`. See [Remote MCP OAuth]({{ '/features/remote-mcp/' | relative_url }}) for details. |
+
 ## Streaming Responses
 
-The agent execution endpoints (`POST /api/sessions/:id/agent/:agent`) return **Server-Sent Events (SSE)**. Each event is a JSON object representing a runtime event (remember that `:agent` is the config filename without the `.yaml` extension):
+The agent execution endpoints (`POST /api/sessions/:id/agent/:agent`) return **Server-Sent Events (SSE)**. The request body is a JSON object with a `messages` array and an optional `model` field. Setting `model` applies a persistent per-agent override on the session before the turn starts (subsequent turns reuse it). An empty or omitted `model` leaves the existing override untouched. (Each event is a JSON object representing a runtime event — remember that `:agent` is the config filename without the `.yaml` extension.):
 
 ```bash
 # Send a message and stream the response
 # (assuming the server was started with: docker agent serve api my-agent.yaml)
 $ curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/my-agent \
   -H "Content-Type: application/json" \
-  -d '[{"role": "user", "content": "Hello!"}]'
+  -d '{"messages":[{"role": "user", "content": "Hello!"}]}'
+
+# Same call, but switch the agent's model for this turn (and persist it):
+$ curl -N -X POST http://localhost:8080/api/sessions/$SID/agent/my-agent \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello!"}],"model":"openai/gpt-4o"}'
 
 # Response (SSE stream):
 data: {"type":"stream_started","session_id":"...","agent":"root"}
@@ -142,7 +157,7 @@ $ curl -X POST http://localhost:8080/api/sessions \
 # 3. Run the agent with a message
 $ curl -N -X POST http://localhost:8080/api/sessions/abc-123/agent/my-agent \
   -H "Content-Type: application/json" \
-  -d '[{"role":"user","content":"What files are in the current directory?"}]'
+  -d '{"messages":[{"role":"user","content":"What files are in the current directory?"}]}'
 ```
 
 ## CLI Flags
@@ -154,13 +169,15 @@ docker agent serve api <agent-file>|<agents-dir> [flags]
 | Flag               | Default          | Description                                      |
 | ------------------ | ---------------- | ------------------------------------------------ |
 | `-l, --listen`     | `127.0.0.1:8080` | Address to listen on                             |
+| `--auth-token`     | (none)           | Bearer token required for all API requests. Leave empty to disable authentication (safe when listening on loopback interfaces only). Recommended when `--listen` binds to a network-reachable interface. |
 | `-s, --session-db` | `session.db`     | Path to the SQLite session database              |
 | `--pull-interval`  | `0` (disabled)   | Auto-pull OCI reference every N minutes          |
 | `--fake`           | (none)           | Replay AI responses from cassette file (testing) |
 | `--record`         | (none)           | Record AI API interactions to cassette file      |
+| `--mcp-oauth-redirect-uri` | (none)   | Public HTTPS URL advertised as the OAuth `redirect_uri` for unmanaged MCP OAuth flows. When set, docker-agent drives PKCE and code exchange in-process and sends the full authorize URL to the client via elicitation. See [Remote MCP]({{ '/features/remote-mcp/' | relative_url }}) for details. |
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Multi-agent configs
+<div class="callout-title">Multi-agent configs
 </div>
   <p>You can point <code>docker agent serve api</code> at a directory containing multiple agent YAML files. Each becomes a separate agent accessible via <code>/api/agents</code>. Combine with <code>--pull-interval</code> to auto-refresh agents from an OCI registry.</p>
 
@@ -185,8 +202,8 @@ By default, tool calls require approval. In the API workflow:
 Toggle auto-approve with `POST /api/sessions/:id/tools/toggle` for automated workflows.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ See also
+<div class="callout-title">See also
 </div>
-  <p>For interactive use, see the <a href="{{ '/features/tui/' | relative_url }}">Terminal UI</a>. For agent-to-agent communication, see <a href="{{ '/features/a2a/' | relative_url }}">A2A Protocol</a> and <a href="{{ '/features/acp/' | relative_url }}">ACP</a>. For MCP integration, see <a href="{{ '/features/mcp-mode/' | relative_url }}">MCP Mode</a>.</p>
+  <p>For interactive use, see the <a href="{{ '/features/tui/' | relative_url }}">Terminal UI</a>. For agent-to-agent communication, see <a href="{{ '/features/a2a/' | relative_url }}">A2A Protocol</a> and <a href="{{ '/features/acp/' | relative_url }}">ACP</a>. For MCP integration, see <a href="{{ '/features/mcp-mode/' | relative_url }}">MCP Mode</a>. For an OpenAI-compatible chat-completions API, see the <a href="{{ '/features/chat-server/' | relative_url }}">Chat Server</a>.</p>
 
 </div>

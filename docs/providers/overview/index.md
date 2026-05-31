@@ -14,12 +14,12 @@ _docker-agent supports multiple AI model providers. Choose the right one for you
   <a class="card" href="{{ '/providers/openai/' | relative_url }}">
     <div class="card-icon">🟢</div>
     <h3>OpenAI</h3>
-    <p>GPT-4o, GPT-5, GPT-5-mini. The most widely used AI models.</p>
+    <p>GPT-5, GPT-5-mini, GPT-4o. The most widely used AI models.</p>
   </a>
   <a class="card" href="{{ '/providers/anthropic/' | relative_url }}">
     <div class="card-icon">🟠</div>
     <h3>Anthropic</h3>
-    <p>Claude Sonnet 4, Claude Sonnet 4.5. Excellent for coding and analysis.</p>
+    <p>Claude Sonnet 4.5, Claude Opus 4.7. Excellent for coding and analysis.</p>
   </a>
   <a class="card" href="{{ '/providers/google/' | relative_url }}">
     <div class="card-icon">🔵</div>
@@ -57,12 +57,16 @@ _docker-agent supports multiple AI model providers. Choose the right one for you
 
 docker-agent also includes built-in aliases for these providers:
 
-| Provider   | API Key Variable  |
-| ---------- | ----------------- |
-| Mistral    | `MISTRAL_API_KEY` |
-| xAI (Grok) | `XAI_API_KEY`     |
-| Nebius     | `NEBIUS_API_KEY`  |
-| MiniMax    | `MINIMAX_API_KEY` |
+| Provider       | Alias            | API Key / Env Variable              |
+| -------------- | ---------------- | ----------------------------------- |
+| Mistral        | `mistral`        | `MISTRAL_API_KEY`                   |
+| xAI (Grok)     | `xai`            | `XAI_API_KEY`                       |
+| Nebius         | `nebius`         | `NEBIUS_API_KEY`                    |
+| MiniMax        | `minimax`        | `MINIMAX_API_KEY`                   |
+| Requesty       | `requesty`       | `REQUESTY_API_KEY`                  |
+| Azure OpenAI   | `azure`          | `AZURE_API_KEY` + `base_url`        |
+| Ollama         | `ollama`         | None (local; optional `base_url`)   |
+| GitHub Copilot | `github-copilot` | `GITHUB_TOKEN` (PAT with `copilot` scope) |
 
 ```bash
 # Use built-in providers inline
@@ -72,7 +76,7 @@ agents:
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Multi-provider teams
+<div class="callout-title">Multi-provider teams
 </div>
   <p>Use expensive models for complex reasoning and cheaper/local models for routine tasks. See the example below.</p>
 
@@ -86,11 +90,11 @@ Different agents can use different providers in the same configuration:
 models:
   claude:
     provider: anthropic
-    model: claude-sonnet-4-0
+    model: claude-sonnet-4-5
     max_tokens: 64000
   gpt:
     provider: openai
-    model: gpt-4o
+    model: gpt-5-mini
   local:
     provider: dmr
     model: ai/qwen3
@@ -100,7 +104,7 @@ agents:
     model: claude # coordinator uses Claude
     sub_agents: [coder, helper]
   coder:
-    model: gpt # coder uses GPT-4o
+    model: gpt # coder uses GPT-5-mini
   helper:
     model: local # helper runs locally for free
 ```

@@ -54,10 +54,12 @@ var (
 
 	// Diff colors
 
-	DiffAddBg    color.Color
-	DiffRemoveBg color.Color
-	DiffAddFg    color.Color
-	DiffRemoveFg color.Color
+	DiffAddBg        color.Color
+	DiffRemoveBg     color.Color
+	DiffAddFg        color.Color
+	DiffRemoveFg     color.Color
+	DiffAddEmphBg    color.Color
+	DiffRemoveEmphBg color.Color
 
 	// UI element colors
 
@@ -295,6 +297,20 @@ var (
 			Foreground(DiffRemoveFg)
 
 	DiffUnchangedStyle = BaseStyle.Background(BackgroundAlt)
+
+	// DiffAddEmphStyle and DiffRemoveEmphStyle highlight the specific tokens
+	// that changed within a modified line. They share the foreground of the
+	// surrounding diff line but use a stronger background so the changed
+	// words are unmistakable.
+	DiffAddEmphStyle = BaseStyle.
+				Background(DiffAddEmphBg).
+				Foreground(DiffAddFg).
+				Bold(true)
+
+	DiffRemoveEmphStyle = BaseStyle.
+				Background(DiffRemoveEmphBg).
+				Foreground(DiffRemoveFg).
+				Bold(true)
 )
 
 // Syntax highlighting UI element styles
@@ -427,22 +443,22 @@ var (
 	NotificationStyle = BaseStyle.
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(Success).
-				Padding(0, 1)
+				Padding(0, 3, 0, 1)
 
 	NotificationInfoStyle = BaseStyle.
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(Info).
-				Padding(0, 1)
+				Padding(0, 3, 0, 1)
 
 	NotificationWarningStyle = BaseStyle.
 					Border(lipgloss.RoundedBorder()).
 					BorderForeground(Warning).
-					Padding(0, 1)
+					Padding(0, 3, 0, 1)
 
 	NotificationErrorStyle = BaseStyle.
 				Border(lipgloss.RoundedBorder()).
 				BorderForeground(Error).
-				Padding(0, 1)
+				Padding(0, 3, 0, 1)
 )
 
 // Completion Styles

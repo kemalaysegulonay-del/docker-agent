@@ -16,7 +16,7 @@ import (
 	"github.com/docker/docker-agent/pkg/effort"
 )
 
-const Version = "8"
+const Version = "9"
 
 // Config represents the entire configuration file
 type Config struct {
@@ -28,6 +28,32 @@ type Config struct {
 	RAG         map[string]RAGToolset     `json:"rag,omitempty"`
 	Metadata    Metadata                  `json:"metadata"`
 	Permissions *PermissionsConfig        `json:"permissions,omitempty"`
+	Runtime     *RuntimeDefaults          `json:"runtime,omitempty"`
+}
+
+// RuntimeDefaults captures execution-time defaults the agent author
+// wants applied when this config is run. The values act as defaults
+// only: an explicit CLI flag or user-config setting always wins.
+type RuntimeDefaults struct {
+	// Sandbox, when true, runs the agent inside a Docker sandbox by
+	// default — equivalent to passing --sandbox on the command line.
+	// Useful for agents that always need filesystem/network isolation.
+	Sandbox bool `json:"sandbox,omitempty" yaml:"sandbox,omitempty"`
+
+	// NetworkAllowlist is the list of hosts that should be added to
+	// the sandbox's default-deny network proxy when this agent runs in
+	// a sandbox. Each entry is a hostname with an optional ":port"
+	// suffix (e.g. "api.example.com", "registry.npmjs.org:443"). The
+	// list is unioned with the gateway and tool-install hosts the
+	// runner already opens automatically; commas and whitespace are
+	// rejected to keep a single entry from smuggling several rules
+	// into the policy engine.
+	//
+	// Use this when an agent's tools call hosts the auto-installer
+	// can't infer (custom MCP endpoints, third-party APIs, registries
+	// not covered by the aqua resolver, etc.) instead of relying on
+	// the wider fallback host set the kit uses on resolution failures.
+	NetworkAllowlist []string `json:"network_allowlist,omitempty" yaml:"network_allowlist,omitempty"`
 }
 
 // MCPToolset is a reusable MCP server definition stored in the top-level
@@ -232,6 +258,14 @@ type ProviderConfig struct {
 	APIType string `json:"api_type,omitempty"`
 	// BaseURL is the base URL for the provider's API endpoint
 	BaseURL string `json:"base_url,omitempty"`
+	// UnloadAPI is the path (or absolute URL) to the provider's
+	// model-unload endpoint. When the agent wires the [unload] builtin
+	// into its `on_agent_switch` hook chain, the previous agent's
+	// models are POSTed `{"model": "<id>"}` here at every switch.
+	// Cloud providers should leave this unset.
+	//
+	// [unload]: https://pkg.go.dev/github.com/docker/docker-agent/pkg/hooks/builtins#Unload
+	UnloadAPI string `json:"unload_api,omitempty"`
 	// TokenKey is the environment variable name containing the API token
 	TokenKey string `json:"token_key,omitempty"`
 	// Temperature is the default sampling temperature for models using this provider
@@ -258,6 +292,10 @@ type ProviderConfig struct {
 	// only Claude Opus 4.7 actually honors it; other models will reject the
 	// field. Accepts an integer token count or a {type: tokens, total: N} object.
 	TaskBudget *TaskBudget `json:"task_budget,omitempty"`
+	// Auth selects a non-API-key authentication scheme for this provider
+	// (currently: Anthropic Workload Identity Federation). When set, the
+	// provider's regular API-key path is bypassed.
+	Auth *AuthConfig `json:"auth,omitempty"`
 }
 
 // FallbackConfig represents fallback model configuration for an agent.
@@ -356,6 +394,23 @@ func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(d.String())
 }
 
+// HarnessConfig configures an agent that delegates execution to an external
+// coding-agent CLI through github.com/rumpl/harness instead of using a
+// docker-agent model provider.
+type HarnessConfig struct {
+	// Type identifies the external harness provider: claude-code, codex, pi, or opencode.
+	Type string `json:"type,omitempty"`
+	// Model is passed to harnesses that accept a model flag. When omitted,
+	// docker-agent lets the external CLI use its own default model.
+	Model string `json:"model,omitempty"`
+	// Effort is forwarded to Claude Code's --effort flag.
+	Effort string `json:"effort,omitempty"`
+	// Agent is forwarded to opencode's --agent flag.
+	Agent string `json:"agent,omitempty"`
+	// Thinking enables opencode's --thinking flag.
+	Thinking bool `json:"thinking,omitempty"`
+}
+
 // AgentConfig represents a single agent configuration
 type AgentConfig struct {
 	Name           string
@@ -365,11 +420,26 @@ type AgentConfig struct {
 	WelcomeMessage string          `json:"welcome_message,omitempty"`
 	Toolsets       []Toolset       `json:"toolsets,omitempty"`
 	Instruction    string          `json:"instruction,omitempty"`
+	Harness        *HarnessConfig  `json:"harness,omitempty"`
 	SubAgents      []string        `json:"sub_agents,omitempty"`
 	Handoffs       []string        `json:"handoffs,omitempty"`
 
-	AddDate                 bool              `json:"add_date,omitempty"`
-	AddEnvironmentInfo      bool              `json:"add_environment_info,omitempty"`
+	AddDate            bool `json:"add_date,omitempty"`
+	AddEnvironmentInfo bool `json:"add_environment_info,omitempty"`
+	// RedactSecrets enables every leg of the redact_secrets feature:
+	// the pre_tool_use builtin (scrubs tool arguments), the
+	// before_llm_call hook (scrubs outgoing chat content), and the
+	// tool_response_transform hook (scrubs tool output before it
+	// reaches event consumers, the persisted session, the post_tool_use
+	// hook, or the next LLM call). Equivalent to writing all three
+	// hook entries by hand — the runtime auto-injects them when this
+	// flag is true. See pkg/hooks/builtins/redact_secrets.go for the
+	// hook-side implementation.
+	//
+	// Pointer (tri-state) so we can distinguish "unset" (nil → default
+	// on) from "explicitly disabled" (false). Use
+	// [AgentConfig.RedactSecretsEnabled] to read the effective value.
+	RedactSecrets           *bool             `json:"redact_secrets,omitempty"`
 	CodeModeTools           bool              `json:"code_mode_tools,omitempty"`
 	AddDescriptionParameter bool              `json:"add_description_parameter,omitempty"`
 	MaxIterations           int               `json:"max_iterations,omitempty"`
@@ -381,19 +451,57 @@ type AgentConfig struct {
 	StructuredOutput        *StructuredOutput `json:"structured_output,omitempty"`
 	Skills                  SkillsConfig      `json:"skills,omitzero"`
 	Hooks                   *HooksConfig      `json:"hooks,omitempty"`
+	Cache                   *CacheConfig      `json:"cache,omitempty"`
+}
+
+// CacheConfig configures the agent's response cache. When set and Enabled
+// is true, the agent stores the assistant response produced for a given
+// user question and replays it when the same question is asked again,
+// skipping the model entirely.
+//
+// Two normalization options control what "same question" means:
+//   - CaseSensitive: when false (the default), question matching is
+//     case-insensitive ("Hello" == "hello").
+//   - TrimSpaces: when true, leading and trailing whitespace is stripped
+//     before comparison ("  hello  " == "hello").
+//
+// Storage is in-memory by default. Set Path to persist entries to a JSON
+// file that is reloaded on startup.
+type CacheConfig struct {
+	Enabled       bool   `json:"enabled,omitempty" yaml:"enabled,omitempty"`
+	CaseSensitive bool   `json:"case_sensitive,omitempty" yaml:"case_sensitive,omitempty"`
+	TrimSpaces    bool   `json:"trim_spaces,omitempty" yaml:"trim_spaces,omitempty"`
+	Path          string `json:"path,omitempty" yaml:"path,omitempty"`
 }
 
 const SkillSourceLocal = "local"
 
-// SkillsConfig controls skill discovery sources for an agent.
+// errSkillsFormat is returned when the `skills` value is neither a boolean nor
+// a list of strings.
+var errSkillsFormat = errors.New("skills must be a boolean or a list of skill sources and/or names")
+
+// SkillsConfig controls skill discovery sources and filtering for an agent.
 // Supports three YAML formats:
 //   - Boolean: `skills: true` (equivalent to ["local"]) or `skills: false` (disabled)
-//   - List:    `skills: ["local", "http://example.com"]`
+//   - List:    `skills: ["local", "http://example.com"]` — sources to load from
+//   - List:    `skills: ["git", "docker"]`               — names of skills to include
+//   - List:    `skills: ["local", "git"]`                — mix of sources and names
+//
+// Items in the list are classified automatically:
+//   - "local" or any HTTP/HTTPS URL → a skill source (added to Sources)
+//   - any other string             → a skill name filter (added to Include)
+//
+// When Include is non-empty but no explicit sources are provided, Sources defaults
+// to ["local"] so that `skills: ["git"]` loads local skills and keeps only "git".
 //
 // The special source "local" loads skills from the filesystem (standard locations).
 // HTTP/HTTPS URLs load skills from remote servers per the well-known skills discovery spec.
 type SkillsConfig struct { //nolint:recvcheck // MarshalYAML/MarshalJSON must use value receiver, UnmarshalYAML/UnmarshalJSON must use pointer
+	// Sources lists where to load skills from: "local" and/or HTTP/HTTPS URLs.
 	Sources []string
+	// Include optionally filters loaded skills by name. When non-empty, only
+	// skills whose Name matches an entry in this list are exposed to the agent.
+	Include []string
 }
 
 func (s SkillsConfig) Enabled() bool {
@@ -407,69 +515,111 @@ func (s SkillsConfig) HasLocal() bool {
 func (s SkillsConfig) RemoteURLs() []string {
 	var urls []string
 	for _, src := range s.Sources {
-		if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		if isRemoteURL(src) {
 			urls = append(urls, src)
 		}
 	}
 	return urls
 }
 
+// isRemoteURL reports whether s looks like an HTTP or HTTPS URL.
+func isRemoteURL(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// isSkillSource reports whether a list item should be treated as a skill source
+// (the special value "local" or an HTTP/HTTPS URL) rather than a skill name.
+func isSkillSource(item string) bool {
+	return item == SkillSourceLocal || isRemoteURL(item)
+}
+
+// setFromBool is the shared "boolean shorthand" logic for YAML and JSON
+// unmarshaling: `true` means load local skills, `false` disables skills.
+func (s *SkillsConfig) setFromBool(b bool) {
+	s.Include = nil
+	if b {
+		s.Sources = []string{SkillSourceLocal}
+	} else {
+		s.Sources = nil
+	}
+}
+
+// setFromList splits items into Sources ("local" + URLs) and Include (skill
+// name filters). When Include is non-empty and Sources is empty, Sources
+// defaults to ["local"] so that `skills: ["git"]` filters local skills
+// without requiring the user to spell out the source.
+func (s *SkillsConfig) setFromList(items []string) {
+	s.Sources = nil
+	s.Include = nil
+	for _, item := range items {
+		if isSkillSource(item) {
+			s.Sources = append(s.Sources, item)
+		} else {
+			s.Include = append(s.Include, item)
+		}
+	}
+	if len(s.Sources) == 0 && len(s.Include) > 0 {
+		s.Sources = []string{SkillSourceLocal}
+	}
+}
+
+// marshalValue returns the canonical encoded representation: `false` when
+// disabled, `true` when only the default local source is set, otherwise a
+// flat []string combining Sources and Include. The default local source is
+// omitted from the list when Include is non-empty so the output round-trips
+// back through setFromList.
+func (s SkillsConfig) marshalValue() any {
+	switch {
+	case len(s.Sources) == 0 && len(s.Include) == 0:
+		return false
+	case len(s.Include) == 0 && len(s.Sources) == 1 && s.Sources[0] == SkillSourceLocal:
+		return true
+	}
+
+	sources := s.Sources
+	if len(s.Include) > 0 && len(sources) == 1 && sources[0] == SkillSourceLocal {
+		sources = nil
+	}
+	out := make([]string, 0, len(sources)+len(s.Include))
+	out = append(out, sources...)
+	out = append(out, s.Include...)
+	return out
+}
+
 func (s *SkillsConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	var b bool
 	if err := unmarshal(&b); err == nil {
-		if b {
-			s.Sources = []string{SkillSourceLocal}
-		} else {
-			s.Sources = nil
-		}
+		s.setFromBool(b)
 		return nil
 	}
-
-	var sources []string
-	if err := unmarshal(&sources); err != nil {
-		return errors.New("skills must be a boolean or a list of sources")
+	var items []string
+	if err := unmarshal(&items); err != nil {
+		return errSkillsFormat
 	}
-	s.Sources = sources
+	s.setFromList(items)
 	return nil
 }
 
 func (s SkillsConfig) MarshalYAML() (any, error) {
-	if len(s.Sources) == 0 {
-		return false, nil
-	}
-	if len(s.Sources) == 1 && s.Sources[0] == SkillSourceLocal {
-		return true, nil
-	}
-	return s.Sources, nil
+	return s.marshalValue(), nil
 }
 
 func (s *SkillsConfig) UnmarshalJSON(data []byte) error {
 	var b bool
 	if err := json.Unmarshal(data, &b); err == nil {
-		if b {
-			s.Sources = []string{SkillSourceLocal}
-		} else {
-			s.Sources = nil
-		}
+		s.setFromBool(b)
 		return nil
 	}
-
-	var sources []string
-	if err := json.Unmarshal(data, &sources); err != nil {
-		return errors.New("skills must be a boolean or a list of sources")
+	var items []string
+	if err := json.Unmarshal(data, &items); err != nil {
+		return errSkillsFormat
 	}
-	s.Sources = sources
+	s.setFromList(items)
 	return nil
 }
 
 func (s SkillsConfig) MarshalJSON() ([]byte, error) {
-	if len(s.Sources) == 0 {
-		return json.Marshal(false)
-	}
-	if len(s.Sources) == 1 && s.Sources[0] == SkillSourceLocal {
-		return json.Marshal(true)
-	}
-	return json.Marshal(s.Sources)
+	return json.Marshal(s.marshalValue())
 }
 
 // GetFallbackModels returns the fallback models from the config.
@@ -478,6 +628,17 @@ func (a *AgentConfig) GetFallbackModels() []string {
 		return a.Fallback.Models
 	}
 	return nil
+}
+
+// RedactSecretsEnabled reports the effective value of the agent's
+// redact_secrets flag. The feature is on by default: a nil pointer
+// (the field omitted from YAML) means enabled, an explicit
+// `redact_secrets: false` is the only way to disable it.
+func (a *AgentConfig) RedactSecretsEnabled() bool {
+	if a == nil || a.RedactSecrets == nil {
+		return true
+	}
+	return *a.RedactSecrets
 }
 
 // GetFallbackRetries returns the fallback retries from the config.
@@ -531,6 +692,11 @@ type ModelConfig struct {
 	// only Claude Opus 4.7 actually honors it; other models will reject the
 	// field. Accepts an integer token count or a {type: tokens, total: N} object.
 	TaskBudget *TaskBudget `json:"task_budget,omitempty"`
+	// Auth selects a non-API-key authentication scheme for this model
+	// (currently: Anthropic Workload Identity Federation). When set, it
+	// takes precedence over both the provider's API-key path and any
+	// auth defined on the referenced ProviderConfig.
+	Auth *AuthConfig `json:"auth,omitempty"`
 	// Routing defines rules for routing requests to different models.
 	// When routing is configured, this model becomes a rule-based router:
 	// - The provider/model fields define the fallback model
@@ -555,6 +721,14 @@ func (m *ModelConfig) Clone() *ModelConfig {
 // otherwise falls back to Model.
 func (m *ModelConfig) DisplayOrModel() string {
 	return cmp.Or(m.DisplayModel, m.Model)
+}
+
+// UnloadAPI returns the unload endpoint inherited from the model's
+// provider config, or "" when no `unload_api` was set. Populated by
+// the provider-config merge step from [ProviderConfig.UnloadAPI].
+func (m *ModelConfig) UnloadAPI() string {
+	v, _ := m.ProviderOpts["unload_api"].(string)
+	return v
 }
 
 // FlexibleModelConfig wraps ModelConfig to support both shorthand and full syntax.
@@ -690,7 +864,7 @@ type Toolset struct {
 	// model name from the models section or "provider/model" (e.g. "openai/gpt-4o-mini").
 	Model string `json:"model,omitempty"`
 
-	Defer DeferConfig `json:"defer" yaml:"defer,omitempty"`
+	Defer DeferConfig `json:"defer,omitzero" yaml:"defer,omitempty"`
 
 	// For the `mcp` tool
 	Command string   `json:"command,omitempty"`
@@ -705,7 +879,7 @@ type Toolset struct {
 	// Set to "false" or "off" to disable auto-install for this toolset.
 	Version string `json:"version,omitempty"`
 
-	// For the `a2a` and `openapi` tools
+	// For the `a2a`, `api`, `openapi` and `fetch` tools
 	Name    string            `json:"name,omitempty"`
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
@@ -730,17 +904,88 @@ type Toolset struct {
 	// For the `filesystem` tool - VCS integration
 	IgnoreVCS *bool `json:"ignore_vcs,omitempty"`
 
+	// For the `filesystem` tool - allow-list of directories the tools are
+	// permitted to access. Each entry may be "." (the agent's working
+	// directory), "~" or "~/..." (the user's home directory), an absolute
+	// path, or a relative path (anchored at the working directory). When
+	// non-empty, every read/write operation is rejected unless its target
+	// resolves under one of the listed roots. Symlinks are followed before
+	// the containment check so they cannot be used to escape the allow-list.
+	// An empty or omitted list preserves the default behaviour (any path
+	// reachable by the process is allowed).
+	AllowList []string `json:"allow_list,omitempty" yaml:"allow_list,omitempty"`
+
+	// For the `filesystem` tool - deny-list of directories the tools are
+	// forbidden to access. Same expansion and matching rules as `allow_list`.
+	// The deny-list takes precedence over `allow_list`: a path that matches
+	// both is rejected. An empty or omitted list disables the deny-list.
+	DenyList []string `json:"deny_list,omitempty" yaml:"deny_list,omitempty"`
+
+	// For the `mcp_catalog` tool - allow-list of catalog server ids that
+	// are offered by default. When non-empty, only these servers are
+	// searchable and enableable; every other catalog entry is hidden. An
+	// empty or omitted list offers the full catalog. Combine with
+	// `blocked_servers` to subtract individual ids from the allowed set
+	// (block takes precedence).
+	AllowedServers []string `json:"allowed_servers,omitempty" yaml:"allowed_servers,omitempty"`
+
+	// For the `mcp_catalog` tool - block-list of catalog server ids that
+	// are removed from the offered set. Applied after `allowed_servers`,
+	// so a server listed in both is blocked. An empty or omitted list
+	// disables the block-list.
+	BlockedServers []string `json:"blocked_servers,omitempty" yaml:"blocked_servers,omitempty"`
+
 	// For the `lsp` tool
 	FileTypes []string `json:"file_types,omitempty"`
 
-	// For the `fetch` tool
+	// HTTP timeout in seconds for `fetch`, `api`, `openapi`, and `a2a` toolsets.
+	// Defaults to 30 seconds when omitted.
 	Timeout int `json:"timeout,omitempty"`
+
+	// For the `fetch` tool - allow-list of domains the tool is permitted to fetch.
+	// A pattern matches the host exactly (case-insensitive) and any of its subdomains;
+	// e.g. "example.com" matches "example.com" and "docs.example.com" but not
+	// "badexample.com". A leading dot (".example.com") restricts the match to
+	// strict subdomains. Mutually exclusive with `blocked_domains`.
+	AllowedDomains []string `json:"allowed_domains,omitempty" yaml:"allowed_domains,omitempty"`
+
+	// For the `fetch` tool - deny-list of domains the tool is forbidden to fetch.
+	// Uses the same matching rules as `allowed_domains`. Mutually exclusive with
+	// `allowed_domains`.
+	BlockedDomains []string `json:"blocked_domains,omitempty" yaml:"blocked_domains,omitempty"`
+
+	// For the `fetch`, `api`, `openapi`, `a2a` and remote `mcp` toolsets — opt in
+	// to dialling non-public IP addresses.
+	//
+	// By default, protected HTTP clients refuse connections (after DNS
+	// resolution, so DNS rebinding is also blocked) to loopback (127/8,
+	// ::1), RFC1918 private ranges, link-local — including the cloud
+	// metadata endpoint at 169.254.169.254 — multicast and the unspecified
+	// address. Set this to true to permit those addresses, which is required
+	// when an agent legitimately needs to call internal services.
+	//
+	// For `fetch`, `allowed_domains` and `blocked_domains` are evaluated
+	// independently of this flag: even with `allow_private_ips: true`, an
+	// entry in `blocked_domains` (or absence from `allowed_domains`) still
+	// rejects the request before any network call.
+	// nil means the field was omitted and may inherit from a referenced definition.
+	AllowPrivateIPs *bool `json:"allow_private_ips,omitempty" yaml:"allow_private_ips,omitempty"`
 
 	// For the `rag` tool
 	RAGConfig *RAGConfig `json:"rag_config,omitempty" yaml:"rag_config,omitempty"`
 
 	// For the `model_picker` tool
 	Models []string `json:"models,omitempty"`
+
+	// For `mcp` and `lsp` tools - optional working directory override.
+	// When set, the toolset process is started from this directory.
+	// Relative paths are resolved relative to the agent's working directory.
+	WorkingDir string `json:"working_dir,omitempty"`
+
+	// For `mcp` and `lsp` tools — lifecycle policy controlling startup,
+	// restart, and backoff behaviour. nil means "use the resilient defaults"
+	// (auto-restart on failure, 5 attempts, 1s..32s exponential backoff).
+	Lifecycle *LifecycleConfig `json:"lifecycle,omitempty"`
 }
 
 func (t *Toolset) UnmarshalYAML(unmarshal func(any) error) error {
@@ -751,6 +996,11 @@ func (t *Toolset) UnmarshalYAML(unmarshal func(any) error) error {
 	}
 	*t = Toolset(tmp)
 	return t.validate()
+}
+
+// AllowPrivateIPsEnabled reports the effective boolean value for allow_private_ips.
+func (t *Toolset) AllowPrivateIPsEnabled() bool {
+	return t != nil && t.AllowPrivateIPs != nil && *t.AllowPrivateIPs
 }
 
 type Remote struct {
@@ -767,6 +1017,20 @@ type RemoteOAuthConfig struct {
 	ClientSecret string   `json:"clientSecret,omitempty"`
 	CallbackPort int      `json:"callbackPort,omitempty"`
 	Scopes       []string `json:"scopes,omitempty"`
+	// CallbackRedirectURL, when set, is used as the OAuth redirect URI
+	// instead of the default http://127.0.0.1:{callbackPort}/callback.
+	// This allows inserting a public-facing proxy (e.g. a URL shortener or
+	// a pre-registered static redirect) in front of the local callback
+	// server — useful for authorization servers that require the redirect
+	// URI to be HTTPS or pre-registered.
+	//
+	// The literal placeholder ${callbackPort} is replaced with the actual
+	// port the local callback server is listening on (either CallbackPort
+	// when set, or a random free port otherwise). The external URL is
+	// expected to redirect the browser back to
+	// http://127.0.0.1:{callbackPort}/callback preserving the OAuth query
+	// parameters.
+	CallbackRedirectURL string `json:"callbackRedirectURL,omitempty"`
 }
 
 // DeferConfig represents the deferred loading configuration for a toolset.
@@ -1321,7 +1585,7 @@ func coerceToInt(v any) int {
 	case int64:
 		return int(val)
 	case uint64:
-		return int(val)
+		return int(val) //nolint:gosec // value comes from validated YAML config; bounds enforced by schema
 	case float64:
 		return int(val)
 	default:
@@ -1546,14 +1810,84 @@ type HooksConfig struct {
 	// PreToolUse hooks run before tool execution
 	PreToolUse []HookMatcherConfig `json:"pre_tool_use,omitempty" yaml:"pre_tool_use,omitempty"`
 
-	// PostToolUse hooks run after tool execution
+	// PostToolUse hooks run after a tool completes — both success and
+	// failure: a failed tool call still fires this event, with the
+	// failure surfaced in tool_response (notably the is_error flag and
+	// any error text). Use post_tool_use to react to either outcome
+	// (logging, audits, circuit-breakers); branch on tool_response.is_error
+	// in the handler when you only want to act on one of them.
 	PostToolUse []HookMatcherConfig `json:"post_tool_use,omitempty" yaml:"post_tool_use,omitempty"`
+
+	// PermissionRequest hooks run just before the runtime would prompt
+	// the user to approve a tool call (i.e. when neither --yolo nor a
+	// permissions rule short-circuited the decision). Hooks may auto-allow
+	// or auto-deny via hook_specific_output.permission_decision so the
+	// user is not prompted; otherwise the runtime falls through to the
+	// usual interactive confirmation. Tool-matched, like pre_tool_use.
+	PermissionRequest []HookMatcherConfig `json:"permission_request,omitempty" yaml:"permission_request,omitempty"`
 
 	// SessionStart hooks run when a session begins
 	SessionStart []HookDefinition `json:"session_start,omitempty" yaml:"session_start,omitempty"`
 
+	// UserPromptSubmit hooks run once per user message, after the user
+	// has submitted their prompt and before the first model call of the
+	// turn. The submitted text is passed in the prompt field. Hooks can
+	// block submission (decision="block" / continue=false / exit code 2)
+	// or contribute additional_context that is spliced into the
+	// conversation as a transient system message for that turn only.
+	// Sub-sessions (transferred tasks, background agents) do not fire
+	// this event because their kick-off message is synthesised by the
+	// runtime, not authored by the user.
+	UserPromptSubmit []HookDefinition `json:"user_prompt_submit,omitempty" yaml:"user_prompt_submit,omitempty"`
+
+	// TurnStart hooks run at the start of every agent turn (each model
+	// call). Their AdditionalContext is appended as transient system
+	// messages for that turn only — it is NOT persisted to the session,
+	// so per-turn signals (date, prompt files, ...) are recomputed every
+	// turn instead of bloating the message history on every resume.
+	TurnStart []HookDefinition `json:"turn_start,omitempty" yaml:"turn_start,omitempty"`
+
+	// TurnEnd hooks run once per agent turn when the turn finishes —
+	// the symmetric counterpart of TurnStart. Fires no matter why the
+	// turn ended: a normal stop, an error, a hook-driven shutdown, the
+	// loop detector, or context cancellation. The reason is reported
+	// in the hook input's reason field ("normal", "continue",
+	// "steered", "error", "canceled", "hook_blocked",
+	// "loop_detected"). Observational; output is ignored.
+	TurnEnd []HookDefinition `json:"turn_end,omitempty" yaml:"turn_end,omitempty"`
+
+	// BeforeLLMCall hooks run just before each model call (after
+	// turn_start). Use this for observability, cost guardrails, or
+	// auditing without contributing system messages — turn_start is the
+	// right event for the latter.
+	BeforeLLMCall []HookDefinition `json:"before_llm_call,omitempty" yaml:"before_llm_call,omitempty"`
+
+	// AfterLLMCall hooks run just after each successful model call,
+	// before the response is recorded into the session and tool calls
+	// are dispatched. Receives the assistant text content in
+	// stop_response.
+	AfterLLMCall []HookDefinition `json:"after_llm_call,omitempty" yaml:"after_llm_call,omitempty"`
+
 	// SessionEnd hooks run when a session ends
 	SessionEnd []HookDefinition `json:"session_end,omitempty" yaml:"session_end,omitempty"`
+
+	// PreCompact hooks run just before the runtime compacts the session
+	// transcript into a summary. The trigger is reported in the source
+	// field: "manual" (user-initiated /compact), "auto" (proactive
+	// threshold), "overflow" (context-overflow recovery), or
+	// "tool_overflow" (proactive after tool results pushed past the
+	// threshold). Hooks may block compaction (decision="block" /
+	// continue=false / exit code 2) or contribute additional_context
+	// that is appended to the compaction prompt — useful for steering
+	// the summary without modifying the agent's instruction.
+	PreCompact []HookDefinition `json:"pre_compact,omitempty" yaml:"pre_compact,omitempty"`
+
+	// SubagentStop hooks run when a sub-agent (transferred task,
+	// background agent, skill sub-session) finishes. The sub-agent's
+	// name is passed in agent_name and its final assistant message in
+	// stop_response. Useful for handoff auditing and per-sub-agent
+	// metrics, separately from the parent's stop event.
+	SubagentStop []HookDefinition `json:"subagent_stop,omitempty" yaml:"subagent_stop,omitempty"`
 
 	// OnUserInput hooks run when the agent needs user input
 	OnUserInput []HookDefinition `json:"on_user_input,omitempty" yaml:"on_user_input,omitempty"`
@@ -1563,6 +1897,58 @@ type HooksConfig struct {
 
 	// Notification hooks run when the agent sends a notification (error, warning) to the user
 	Notification []HookDefinition `json:"notification,omitempty" yaml:"notification,omitempty"`
+
+	// OnError hooks run when the runtime hits an error during a turn
+	// (model failures, repetitive tool-call loops). Fires alongside
+	// Notification with level="error".
+	OnError []HookDefinition `json:"on_error,omitempty" yaml:"on_error,omitempty"`
+
+	// OnMaxIterations hooks run when the runtime reaches its configured
+	// max_iterations limit. Fires alongside Notification with
+	// level="warning".
+	OnMaxIterations []HookDefinition `json:"on_max_iterations,omitempty" yaml:"on_max_iterations,omitempty"`
+
+	// OnAgentSwitch hooks run whenever the runtime moves the active
+	// agent to a new one — transfer_task, handoff, or the return
+	// after a transferred task completes. Observational; useful for
+	// audit, transcript, and metrics pipelines.
+	OnAgentSwitch []HookDefinition `json:"on_agent_switch,omitempty" yaml:"on_agent_switch,omitempty"`
+
+	// OnSessionResume hooks run when the user explicitly approves the
+	// runtime to continue past its configured max_iterations limit.
+	// Observational; useful for alerting on extended-runtime sessions.
+	OnSessionResume []HookDefinition `json:"on_session_resume,omitempty" yaml:"on_session_resume,omitempty"`
+
+	// OnToolApprovalDecision hooks run after the runtime's tool
+	// approval chain resolves a verdict for a tool call. Observational;
+	// gives audit pipelines a structured "who approved what" record
+	// without re-implementing the chain.
+	OnToolApprovalDecision []HookDefinition `json:"on_tool_approval_decision,omitempty" yaml:"on_tool_approval_decision,omitempty"`
+
+	// BeforeCompaction hooks run immediately before a session compaction.
+	// Hooks may veto compaction (Decision: "block") or supply a custom
+	// summary via HookSpecificOutput.summary, in which case the runtime
+	// applies that summary verbatim and skips the LLM call. Hooks receive
+	// the current input/output token counts, the model context limit, and
+	// a compaction_reason of "threshold", "overflow", or "manual".
+	BeforeCompaction []HookDefinition `json:"before_compaction,omitempty" yaml:"before_compaction,omitempty"`
+
+	// AfterCompaction hooks run after a successful compaction (a summary
+	// was applied to the session). The Input.summary field carries the
+	// produced summary text. AfterCompaction is purely observational.
+	AfterCompaction []HookDefinition `json:"after_compaction,omitempty" yaml:"after_compaction,omitempty"`
+
+	// ToolResponseTransform hooks run between a tool's exec and the
+	// runtime's emission/record of the response. Hooks may rewrite the
+	// tool's textual output by returning a non-empty
+	// HookSpecificOutput.updated_tool_response — the runtime applies
+	// the rewrite before the response fans out to event consumers, the
+	// recorded chat message, and the post_tool_use hook input. This is
+	// the third leg of the redact_secrets feature: pre_tool_use scrubs
+	// arguments, before_llm_call scrubs outgoing chat content, and
+	// tool_response_transform scrubs tool output. Tool-matched, like
+	// pre_tool_use / post_tool_use.
+	ToolResponseTransform []HookMatcherConfig `json:"tool_response_transform,omitempty" yaml:"tool_response_transform,omitempty"`
 }
 
 // IsEmpty returns true if no hooks are configured
@@ -1572,11 +1958,27 @@ func (h *HooksConfig) IsEmpty() bool {
 	}
 	return len(h.PreToolUse) == 0 &&
 		len(h.PostToolUse) == 0 &&
+		len(h.PermissionRequest) == 0 &&
 		len(h.SessionStart) == 0 &&
+		len(h.UserPromptSubmit) == 0 &&
+		len(h.TurnStart) == 0 &&
+		len(h.TurnEnd) == 0 &&
+		len(h.BeforeLLMCall) == 0 &&
+		len(h.AfterLLMCall) == 0 &&
 		len(h.SessionEnd) == 0 &&
+		len(h.PreCompact) == 0 &&
+		len(h.SubagentStop) == 0 &&
 		len(h.OnUserInput) == 0 &&
 		len(h.Stop) == 0 &&
-		len(h.Notification) == 0
+		len(h.Notification) == 0 &&
+		len(h.OnError) == 0 &&
+		len(h.OnMaxIterations) == 0 &&
+		len(h.OnAgentSwitch) == 0 &&
+		len(h.OnSessionResume) == 0 &&
+		len(h.OnToolApprovalDecision) == 0 &&
+		len(h.BeforeCompaction) == 0 &&
+		len(h.AfterCompaction) == 0 &&
+		len(h.ToolResponseTransform) == 0
 }
 
 // HookMatcherConfig represents a hook matcher with its hooks.
@@ -1592,18 +1994,89 @@ type HookMatcherConfig struct {
 
 // HookDefinition represents a single hook configuration
 type HookDefinition struct {
-	// Type specifies the hook type (currently only "command" is supported)
+	// Name gives the hook a friendly label for logs and runtime events.
+	Name string `json:"name,omitempty" yaml:"name,omitempty"`
+
+	// Type specifies the hook type. Supported values:
+	//   - "command":  run a shell command (default)
+	//   - "builtin":  invoke a named, in-process Go function (the name
+	//                 lives in Command). The set of registered builtins
+	//                 is owned by the runtime; the docker-agent runtime
+	//                 ships add_date, add_environment_info,
+	//                 add_prompt_files, redact_secrets (see also the
+	//                 redact_secrets agent flag), and several others
+	//                 documented in pkg/hooks/builtins.
+	//   - "model":    ask an LLM and translate its reply into the hook's
+	//                 native output. See Model / Prompt / Schema. Used to
+	//                 implement "LLM as a judge" pre_tool_use hooks,
+	//                 turn-start summarizers, etc., with no Go code.
 	Type string `json:"type" yaml:"type"`
 
-	// Command is the shell command to execute
+	// Command is the shell command (Type==command) or the builtin name
+	// (Type==builtin) to invoke.
 	Command string `json:"command,omitempty" yaml:"command,omitempty"`
+
+	// Args are arbitrary string arguments passed to the hook handler.
+	// Builtin handlers receive them as the args parameter; future handler
+	// kinds (http, mcp, ...) can adopt the same field. Empty for command
+	// hooks today (the shell command stays self-contained).
+	Args []string `json:"args,omitempty" yaml:"args,omitempty"`
 
 	// Timeout is the execution timeout in seconds (default: 60)
 	Timeout int `json:"timeout,omitempty" yaml:"timeout,omitempty"`
+
+	// Env adds or overrides environment variables for this hook only.
+	Env map[string]string `json:"env,omitempty" yaml:"env,omitempty"`
+
+	// WorkingDir overrides the runtime working directory for this hook.
+	WorkingDir string `json:"working_dir,omitempty" yaml:"working_dir,omitempty"`
+
+	// OnError controls non-fail-closed hook failures: warn (default), ignore, or block.
+	OnError string `json:"on_error,omitempty" yaml:"on_error,omitempty"`
+
+	// Model is the model spec ("provider/model", e.g. "openai/gpt-4o-mini")
+	// invoked by Type==model hooks. Required for that type, ignored
+	// otherwise.
+	Model string `json:"model,omitempty" yaml:"model,omitempty"`
+
+	// Prompt is the user-message template rendered for each invocation
+	// of a Type==model hook. It is parsed as a Go text/template with the
+	// hook [Input] as the data context (so {{ .ToolName }},
+	// {{ .ToolInput }}, etc. work). Required for Type==model.
+	Prompt string `json:"prompt,omitempty" yaml:"prompt,omitempty"`
+
+	// Schema selects a well-known response interpretation for Type==model
+	// hooks. The empty value means "return the model's reply as
+	// additional_context". Other values (registered by the runtime) ask
+	// the provider for strict-JSON output and translate the result into
+	// the right Output shape (e.g. "pre_tool_use_decision" produces a
+	// permission_decision verdict).
+	Schema string `json:"schema,omitempty" yaml:"schema,omitempty"`
 }
 
-// validate validates the HooksConfig
-func (h *HooksConfig) validate() error {
+// GetTimeout returns the per-hook execution timeout, defaulting to 60
+// seconds when [HookDefinition.Timeout] is zero or negative.
+func (h *HookDefinition) GetTimeout() time.Duration {
+	if h.Timeout <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(h.Timeout) * time.Second
+}
+
+// DisplayName returns a human-friendly identifier for the hook: the
+// configured Name when set, otherwise the Command, otherwise the Type.
+func (h *HookDefinition) DisplayName() string {
+	if h.Name != "" {
+		return h.Name
+	}
+	if h.Command != "" {
+		return h.Command
+	}
+	return h.Type
+}
+
+// Validate validates the HooksConfig
+func (h *HooksConfig) Validate() error {
 	// Validate PreToolUse matchers
 	for i, m := range h.PreToolUse {
 		if err := m.validate("pre_tool_use", i); err != nil {
@@ -1618,6 +2091,13 @@ func (h *HooksConfig) validate() error {
 		}
 	}
 
+	// Validate PermissionRequest matchers
+	for i, m := range h.PermissionRequest {
+		if err := m.validate("permission_request", i); err != nil {
+			return err
+		}
+	}
+
 	// Validate SessionStart hooks
 	for i, hook := range h.SessionStart {
 		if err := hook.validate("session_start", i); err != nil {
@@ -1625,9 +2105,58 @@ func (h *HooksConfig) validate() error {
 		}
 	}
 
+	// Validate UserPromptSubmit hooks
+	for i, hook := range h.UserPromptSubmit {
+		if err := hook.validate("user_prompt_submit", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate TurnStart hooks
+	for i, hook := range h.TurnStart {
+		if err := hook.validate("turn_start", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate TurnEnd hooks
+	for i, hook := range h.TurnEnd {
+		if err := hook.validate("turn_end", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate BeforeLLMCall hooks
+	for i, hook := range h.BeforeLLMCall {
+		if err := hook.validate("before_llm_call", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate AfterLLMCall hooks
+	for i, hook := range h.AfterLLMCall {
+		if err := hook.validate("after_llm_call", i); err != nil {
+			return err
+		}
+	}
+
 	// Validate SessionEnd hooks
 	for i, hook := range h.SessionEnd {
 		if err := hook.validate("session_end", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate PreCompact hooks
+	for i, hook := range h.PreCompact {
+		if err := hook.validate("pre_compact", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate SubagentStop hooks
+	for i, hook := range h.SubagentStop {
+		if err := hook.validate("subagent_stop", i); err != nil {
 			return err
 		}
 	}
@@ -1649,6 +2178,62 @@ func (h *HooksConfig) validate() error {
 	// Validate Notification hooks
 	for i, hook := range h.Notification {
 		if err := hook.validate("notification", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate OnError hooks
+	for i, hook := range h.OnError {
+		if err := hook.validate("on_error", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate OnMaxIterations hooks
+	for i, hook := range h.OnMaxIterations {
+		if err := hook.validate("on_max_iterations", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate OnAgentSwitch hooks
+	for i, hook := range h.OnAgentSwitch {
+		if err := hook.validate("on_agent_switch", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate OnSessionResume hooks
+	for i, hook := range h.OnSessionResume {
+		if err := hook.validate("on_session_resume", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate OnToolApprovalDecision hooks
+	for i, hook := range h.OnToolApprovalDecision {
+		if err := hook.validate("on_tool_approval_decision", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate BeforeCompaction hooks
+	for i, hook := range h.BeforeCompaction {
+		if err := hook.validate("before_compaction", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate AfterCompaction hooks
+	for i, hook := range h.AfterCompaction {
+		if err := hook.validate("after_compaction", i); err != nil {
+			return err
+		}
+	}
+
+	// Validate ToolResponseTransform matchers
+	for i, m := range h.ToolResponseTransform {
+		if err := m.validate("tool_response_transform", i); err != nil {
 			return err
 		}
 	}
@@ -1677,12 +2262,24 @@ func (h *HookDefinition) validate(prefix string, index int) error {
 		return fmt.Errorf("hooks.%s[%d]: type is required", prefix, index)
 	}
 
-	if h.Type != "command" {
-		return fmt.Errorf("hooks.%s[%d]: unsupported hook type '%s' (only 'command' is supported)", prefix, index, h.Type)
-	}
-
-	if h.Command == "" {
-		return fmt.Errorf("hooks.%s[%d]: command is required for command hooks", prefix, index)
+	switch h.Type {
+	case "command":
+		if h.Command == "" {
+			return fmt.Errorf("hooks.%s[%d]: command is required for command hooks", prefix, index)
+		}
+	case "builtin":
+		if h.Command == "" {
+			return fmt.Errorf("hooks.%s[%d]: command must name the builtin to invoke", prefix, index)
+		}
+	case "model":
+		if h.Model == "" {
+			return fmt.Errorf("hooks.%s[%d]: model is required for model hooks (e.g. 'openai/gpt-4o-mini')", prefix, index)
+		}
+		if h.Prompt == "" {
+			return fmt.Errorf("hooks.%s[%d]: prompt is required for model hooks", prefix, index)
+		}
+	default:
+		return fmt.Errorf("hooks.%s[%d]: unsupported hook type '%s' (supported: 'command', 'builtin', 'model')", prefix, index, h.Type)
 	}
 
 	return nil

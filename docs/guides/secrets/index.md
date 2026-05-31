@@ -10,16 +10,20 @@ _How to securely provide API keys and credentials to docker-agent._
 
 ## Overview
 
-docker-agent needs API keys to talk to model providers (OpenAI, Anthropic, etc.) and MCP tool servers (GitHub, Slack, etc.). These keys are **never stored in config files**. Instead, docker-agent resolves them at runtime through a chain of secret providers, checked in order:
+docker-agent needs API keys to talk to model providers (OpenAI, Anthropic, etc.) and MCP tool servers (GitHub, Slack, etc.). These keys are **never stored in config files**. Instead, docker-agent resolves them at runtime through a chain of secret providers, checked in order (see `pkg/environment/default.go`):
 
 | Priority | Provider | Description |
 | --- | --- | --- |
 | 1 | [Environment variables](#environment-variables) | `export OPENAI_API_KEY=sk-...` |
-| 2 | [Docker secrets](#docker-compose-secrets) | Files in `/run/secrets/` |
-| 3 | [`pass` password manager](#pass-password-manager) | `pass insert OPENAI_API_KEY` |
-| 4 | [macOS Keychain](#macos-keychain) | `security add-generic-password` |
+| 2 | [Docker Compose secrets](#docker-compose-secrets) | Files in `/run/secrets/` |
+| 3 | [Credential helper](#credential-helper) | Custom command declared in `~/.config/cagent/config.yaml` under `credential_helper:` |
+| 4 | [Docker Desktop](#docker-desktop) | Secrets stored by the Docker Desktop backend (no setup on a Desktop install) |
+| 5 | [`pass` password manager](#pass-password-manager) | `pass insert OPENAI_API_KEY` |
+| 6 | [macOS Keychain](#macos-keychain) | `security add-generic-password` |
 
 The first provider that has a value wins. You can mix and match — for example, use environment variables for one key and Keychain for another.
+
+When docker-agent runs inside a Docker sandbox (detected via `SANDBOX_VM_ID`), a sandbox token provider is prepended to the chain so that `DOCKER_TOKEN` is read from a continuously-refreshed file instead of a stale environment variable.
 
 ## Environment Variables
 
@@ -75,7 +79,7 @@ The file format supports:
 - Blank lines are ignored
 
 <div class="callout callout-warning" markdown="1">
-<div class="callout-title">⚠️ Important</div>
+<div class="callout-title">Important</div>
 <p>Add <code>.env</code> to your <code>.gitignore</code> to avoid committing secrets to version control.</p>
 </div>
 
@@ -147,6 +151,25 @@ secrets:
 | Visibility | Shown in process list and inspect output | Not exposed in `docker inspect` |
 | Best for | Development | Production and CI/CD |
 
+## Credential Helper
+
+docker-agent can shell out to an external credential helper you define in your user config. This is useful when your organisation already has a secrets daemon you want to reuse (HashiCorp Vault, 1Password CLI, `bitwarden-cli`, etc.).
+
+Declare the helper in `~/.config/cagent/config.yaml`:
+
+```yaml
+# ~/.config/cagent/config.yaml
+credential_helper:
+  command: op
+  args: ["read", "op://Personal/docker-agent"]
+```
+
+The command is invoked with the variable name appended as the final argument, and must print the secret value to stdout.
+
+## Docker Desktop
+
+On machines where Docker Desktop is installed, docker-agent queries Docker Desktop's backend for secrets stored against your signed-in Docker account. This is transparent — no extra configuration — and it is how signed-in Docker users get provider API keys without setting any environment variables.
+
 ## `pass` Password Manager
 
 docker-agent integrates with [`pass`](https://www.passwordstore.org/), the standard Unix password manager. Secrets are stored as GPG-encrypted files in `~/.password-store/`.
@@ -204,3 +227,26 @@ Once stored, docker-agent finds the secret automatically — no flags or config 
 | macOS Keychain | macOS local development | Low |
 
 You can combine methods. For example, store long-lived provider keys in macOS Keychain and pass project-specific MCP tokens via env files.
+
+## Preventing Secret Leaks
+
+Provider keys live in the secret store and are passed to docker-agent through the chain above — the agent itself never receives them as input. But the **content of a conversation** can still leak credentials: a user pasting a token, a tool returning a config file with embedded keys, a transcript dumped into a prompt.
+
+For that defense-in-depth case, set `redact_secrets: true` on an agent. It scrubs detected secrets out of:
+
+- the arguments of every outgoing tool call (before the tool sees them),
+- every outgoing chat message (before the model provider sees them), and
+- every tool's output (before it reaches event consumers, the persisted session file, the `post_tool_use` hook input, or the next LLM call).
+
+```yaml
+agents:
+  root:
+    model: openai/gpt-5-mini
+    description: A helpful assistant
+    instruction: You are a helpful assistant.
+    redact_secrets: true
+    toolsets:
+      - type: shell
+```
+
+The ruleset covers GitHub PATs, AWS / GCP / Azure credentials, Stripe / Slack / GitLab / Hugging Face tokens, JWTs, PEM-encoded private keys, Docker Hub PATs, and many others. Each detected span is replaced with the literal `[REDACTED]`. See the [Redacting Secrets]({{ '/configuration/agents/#redacting-secrets' | relative_url }}) section in the agent configuration reference for the full picture and important caveats about false negatives.

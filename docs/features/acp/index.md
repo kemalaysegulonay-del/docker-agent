@@ -15,7 +15,7 @@ The `docker agent serve acp` command starts an ACP server that communicates over
 ACP is built on the [ACP Go SDK](https://github.com/coder/acp-go-sdk) and provides a standardized way for client applications to interact with AI agents.
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ ACP vs A2A vs MCP
+<div class="callout-title">ACP vs A2A vs MCP
 </div>
   **ACP** connects an agent to a *host application* (IDE, CLI tool) via stdio. **A2A** connects *agents to other agents* over HTTP. **MCP** exposes agents as *tools* for other MCP clients. Choose based on your integration target.
 
@@ -67,9 +67,19 @@ Host Application
 docker agent serve acp <agent-file>|<registry-ref> [flags]
 ```
 
-| Flag               | Default                | Description                         |
-| ------------------ | ---------------------- | ----------------------------------- |
-| `-s, --session-db` | `~/.cagent/session.db` | Path to the SQLite session database |
+| Flag                              | Default                | Description                                                                                                          |
+| --------------------------------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `-s, --session-db <path>`         | `~/.cagent/session.db` | Path to the SQLite session database.                                                                                 |
+| `--working-dir <path>`            | current dir            | Working directory the agent runs in.                                                                                 |
+| `--env-from-file <file>`          | (none)                 | Load additional environment variables from a `.env` file (repeatable).                                               |
+| `--models-gateway <url>`          | (none)                 | Route all provider traffic through a models gateway URL.                                                             |
+| `--code-mode-tools`               | `false`                | Expose tools as a single "code" toolset that accepts a JavaScript snippet to run.                                    |
+| `--hook-pre-tool-use <cmd>`       | (none)                 | Add a pre-tool-use hook (repeatable). See [Hooks]({{ '/configuration/hooks/' | relative_url }}).                     |
+| `--hook-post-tool-use <cmd>`      | (none)                 | Add a post-tool-use hook (repeatable).                                                                               |
+| `--hook-session-start <cmd>`      | (none)                 | Add a session-start hook (repeatable).                                                                               |
+| `--hook-session-end <cmd>`        | (none)                 | Add a session-end hook (repeatable).                                                                                 |
+| `--hook-on-user-input <cmd>`      | (none)                 | Add an on-user-input hook (repeatable).                                                                              |
+| `--hook-stop <cmd>`               | (none)                 | Add a stop hook, fired when the model finishes responding (repeatable).                                              |
 
 ## Integration Example
 
@@ -96,14 +106,14 @@ child.stdout.on("data", (data) => {
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 When to use ACP
+<div class="callout-title">When to use ACP
 </div>
   <p>Use ACP when building **IDE integrations**, **editor plugins**, or any tool that wants to embed a docker-agent agent as a subprocess. For HTTP-based integrations, use the <a href="{{ '/features/api-server/' | relative_url }}">API Server</a> instead.</p>
 
 </div>
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ See also
+<div class="callout-title">See also
 </div>
   <p>For HTTP-based agent access, see the <a href="{{ '/features/api-server/' | relative_url }}">API Server</a>. For agent-to-agent communication, see <a href="{{ '/features/a2a/' | relative_url }}">A2A Protocol</a>. For exposing agents as MCP tools, see <a href="{{ '/features/mcp-mode/' | relative_url }}">MCP Mode</a>.</p>
 

@@ -24,6 +24,8 @@
   items:
     - title: Overview
       url: /configuration/overview/
+    - title: HCL Configuration
+      url: /configuration/hcl/
     - title: Agent Config
       url: /configuration/agents/
     - title: Model Config
@@ -53,6 +55,8 @@
       url: /tools/todo/
     - title: Memory
       url: /tools/memory/
+    - title: Tasks
+      url: /tools/tasks/
     - title: Fetch
       url: /tools/fetch/
     - title: Script
@@ -69,10 +73,18 @@
       url: /tools/background-agents/
     - title: Handoff
       url: /tools/handoff/
+    - title: Model Picker
+      url: /tools/model-picker/
     - title: OpenAPI
       url: /tools/openapi/
+    - title: MCP
+      url: /tools/mcp/
     - title: A2A
       url: /tools/a2a/
+    - title: RAG
+      url: /tools/rag/
+    - title: MCP Catalog
+      url: /tools/mcp-catalog/
 
 - section: Features
   items:
@@ -88,10 +100,10 @@
       url: /features/acp/
     - title: API Server
       url: /features/api-server/
+    - title: Chat Server
+      url: /features/chat-server/
     - title: Evaluation
       url: /features/evaluation/
-    - title: RAG
-      url: /features/rag/
     - title: Skills
       url: /features/skills/
     - title: Remote MCP Servers
@@ -119,6 +131,8 @@
       url: /providers/nebius/
     - title: MiniMax
       url: /providers/minimax/
+    - title: GitHub Copilot
+      url: /providers/github-copilot/
     - title: Local Models
       url: /providers/local/
     - title: Provider Definitions

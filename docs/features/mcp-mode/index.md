@@ -18,7 +18,7 @@ The `docker agent serve mcp` command makes your agents available to any applicat
 - Integrate domain-specific agents into existing workflows
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ What is MCP?
+<div class="callout-title">What is MCP?
 </div>
   <p>The <a href="https://modelcontextprotocol.io/">Model Context Protocol</a> is an open standard for connecting AI tools. See also <a href="{{ '/features/remote-mcp/' | relative_url }}">Remote MCP Servers</a> for connecting to cloud services.</p>
 
@@ -27,7 +27,7 @@ The `docker agent serve mcp` command makes your agents available to any applicat
 ## Basic Usage
 
 ```bash
-# Expose a local config
+# Expose a local config (stdio transport, the default)
 $ docker agent serve mcp ./agent.yaml
 
 # Expose from a registry
@@ -36,6 +36,30 @@ $ docker agent serve mcp agentcatalog/pirate
 # Set the working directory
 $ docker agent serve mcp ./agent.yaml --working-dir /path/to/project
 ```
+
+## Transports
+
+By default, `serve mcp` uses the stdio transport — ideal for clients that spawn the server as a subprocess (Claude Desktop, Claude Code, Cursor, …).
+
+To expose the MCP server over streaming HTTP instead, pass `--http`:
+
+```bash
+# Streaming HTTP transport on the default 127.0.0.1:8081
+$ docker agent serve mcp ./agent.yaml --http
+
+# Override the listen address / port
+$ docker agent serve mcp ./agent.yaml --http --listen 0.0.0.0:9090
+```
+
+| Flag                   | Default            | Description                                                                                                  |
+| ---------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `--http`               | `false`            | Use streaming HTTP transport instead of stdio.                                                               |
+| `-l`, `--listen`       | `127.0.0.1:8081`   | Address to listen on when `--http` is enabled.                                                               |
+| `-a`, `--agent`        | all agents         | Expose a single named agent instead of every agent in the config.                                            |
+| `--tool-name`          | (none)             | Override the MCP tool identifier clients call (defaults to agent name); only valid when exposing one agent.  |
+| `--mcp-keepalive`      | `0`                | Interval between MCP keep-alive pings (e.g. `30s`); `0` disables keep-alive.                                 |
+
+Runtime configuration flags such as `--working-dir`, `--env-from-file`, `--models-gateway`, and hook flags are also available — see the [CLI reference]({{ '/features/cli/' | relative_url }}).
 
 ## Using with Claude Desktop
 
@@ -84,14 +108,14 @@ When you expose a multi-agent configuration via MCP, each agent becomes a separa
 ```yaml
 agents:
   root:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Main coordinator
     sub_agents: [designer, engineer]
   designer:
     model: openai/gpt-5-mini
     description: UI/UX design specialist
   engineer:
-    model: anthropic/claude-sonnet-4-0
+    model: anthropic/claude-sonnet-4-5
     description: Software engineer
 ```
 

@@ -18,7 +18,7 @@ The `providers` section in your agent YAML lets you define named provider config
 - **Any provider type** — Works with OpenAI, Anthropic, Google, Bedrock, and any OpenAI-compatible API
 
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Works with any provider
+<div class="callout-title">Works with any provider
 </div>
   <p>The <code>providers</code> section supports all provider types: <code>openai</code>, <code>anthropic</code>, <code>google</code>, <code>amazon-bedrock</code>, <code>dmr</code>, and any built-in alias. When the <code>provider</code> field is not set, it defaults to <code>openai</code> for backward compatibility.</p>
 
@@ -100,6 +100,7 @@ agents:
 | `api_type`            | string     | API schema: `openai_chatcompletions` or `openai_responses`. Only for OpenAI-compatible providers. | `openai_chatcompletions` |
 | `base_url`            | string     | Base URL for the API endpoint. Required for OpenAI-compatible providers, optional for native providers. | —                        |
 | `token_key`           | string     | Environment variable name containing the API token.                                   | —                        |
+| `unload_api`          | string     | Optional path (or absolute URL) to the provider's model-unload endpoint. Used by the [`unload`]({{ '/configuration/hooks/#available-built-ins' | relative_url }}) built-in hook to release model resources between agent switches. Relative paths resolve against `base_url`'s scheme + host; absolute URLs are used verbatim. Today only Docker Model Runner ships a provider that calls this endpoint; cloud providers don't implement the underlying interface and the hook silently skips them. | —                        |
 | `temperature`         | float      | Default sampling temperature (0.0–2.0).                                               | —                        |
 | `max_tokens`          | int        | Default maximum response tokens.                                                      | —                        |
 | `top_p`               | float      | Default nucleus sampling threshold (0.0–1.0).                                         | —                        |
@@ -181,7 +182,7 @@ providers:
 
 agents:
   root:
-    model: router/anthropic/claude-sonnet-4-0
+    model: router/anthropic/claude-sonnet-4-5
 ```
 
 ### Azure OpenAI

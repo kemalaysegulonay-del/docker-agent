@@ -7,7 +7,8 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"github.com/docker/docker-agent/pkg/tools/builtin"
+	pathx "github.com/docker/docker-agent/pkg/path"
+	"github.com/docker/docker-agent/pkg/tools/builtin/filesystem"
 	"github.com/docker/docker-agent/pkg/tui/components/spinner"
 	"github.com/docker/docker-agent/pkg/tui/components/toolcommon"
 	"github.com/docker/docker-agent/pkg/tui/core/layout"
@@ -22,7 +23,7 @@ func New(msg *types.Message, sessionState service.SessionStateReader) layout.Mod
 
 func render(msg *types.Message, s spinner.Spinner, sessionState service.SessionStateReader, width, _ int) string {
 	// Parse arguments
-	var args builtin.ReadMultipleFilesArgs
+	var args filesystem.ReadMultipleFilesArgs
 	if err := json.Unmarshal([]byte(msg.ToolCall.Function.Arguments), &args); err != nil {
 		return toolcommon.RenderTool(msg, s, "", "", width, sessionState.HideToolResults())
 	}
@@ -33,9 +34,9 @@ func render(msg *types.Message, s spinner.Spinner, sessionState service.SessionS
 	}
 
 	// For completed/error state, render each file line
-	var meta *builtin.ReadMultipleFilesMeta
+	var meta *filesystem.ReadMultipleFilesMeta
 	if msg.ToolResult != nil {
-		if m, ok := msg.ToolResult.Meta.(builtin.ReadMultipleFilesMeta); ok {
+		if m, ok := msg.ToolResult.Meta.(filesystem.ReadMultipleFilesMeta); ok {
 			meta = &m
 		}
 	}
@@ -87,14 +88,14 @@ type fileSummary struct {
 }
 
 // formatSummaryLines creates a summary for each file from metadata.
-func formatSummaryLines(meta *builtin.ReadMultipleFilesMeta) []fileSummary {
+func formatSummaryLines(meta *filesystem.ReadMultipleFilesMeta) []fileSummary {
 	if meta == nil || len(meta.Files) == 0 {
 		return nil
 	}
 
 	var summaries []fileSummary
 	for _, file := range meta.Files {
-		path := toolcommon.ShortenPath(file.Path)
+		path := pathx.ShortenHome(file.Path)
 		var output string
 		if file.Error != "" {
 			output = " " + file.Error
@@ -120,7 +121,7 @@ func formatFilesList(filePaths []string) string {
 
 	shortened := make([]string, len(filePaths))
 	for i, p := range filePaths {
-		shortened[i] = toolcommon.ShortenPath(p)
+		shortened[i] = pathx.ShortenHome(p)
 	}
 
 	if len(shortened) == 1 {

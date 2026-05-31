@@ -83,7 +83,7 @@ func fetchAndCache(ctx context.Context) (Catalog, error) {
 
 	catalog, newETag, err := fetchFromNetwork(ctx, cached.ETag)
 	if err != nil {
-		slog.Debug("Failed to fetch MCP catalog from network, using cache", "error", err)
+		slog.DebugContext(ctx, "Failed to fetch MCP catalog from network, using cache", "error", err)
 		if cached.Catalog != nil {
 			return cached.Catalog, nil
 		}
@@ -92,11 +92,11 @@ func fetchAndCache(ctx context.Context) (Catalog, error) {
 
 	// A nil catalog means 304 Not Modified — the cached copy is still valid.
 	if catalog == nil {
-		slog.Debug("MCP catalog not modified (ETag match)")
+		slog.DebugContext(ctx, "MCP catalog not modified (ETag match)")
 		return cached.Catalog, nil
 	}
 
-	slog.Debug("MCP catalog fetched from network")
+	slog.DebugContext(ctx, "MCP catalog fetched from network")
 	saveToDisk(cacheFile, catalog, newETag)
 
 	return catalog, nil
@@ -137,7 +137,7 @@ func saveToDisk(path string, catalog Catalog, etag string) {
 			slog.Warn("Failed to create MCP catalog temp file", "error", err)
 			return
 		}
-		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil {
+		if mkErr := os.MkdirAll(dir, 0o755); mkErr != nil { //nolint:gosec // shared with other docker MCP gateway processes
 			slog.Warn("Failed to create MCP catalog cache directory", "error", mkErr)
 			return
 		}

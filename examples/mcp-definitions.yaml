@@ -1,4 +1,3 @@
-#!/usr/bin/env docker agent run
 # yaml-language-server: $schema=../agent-schema.json
 
 # This example demonstrates how to use the top-level `mcps` section to define
@@ -17,7 +16,7 @@ mcps:
     ref: docker:context7
 
   github:
-    ref: docker:github
+    ref: docker:github-official
     env:
       GITHUB_PERSONAL_ACCESS_TOKEN: "${GITHUB_PERSONAL_ACCESS_TOKEN}"
     tools:

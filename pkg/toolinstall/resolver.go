@@ -7,8 +7,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 
+	"github.com/fatih/color"
+	"github.com/mattn/go-isatty"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -60,7 +63,7 @@ func resolve(ctx context.Context, command, version string) (string, error) {
 
 	// Use singleflight to deduplicate concurrent installs of the same command.
 	result, err, _ := installGroup.Do(command, func() (any, error) {
-		return doInstall(ctx, command, version)
+		return safeInstall(ctx, command, version)
 	})
 	if err != nil {
 		return "", err
@@ -68,6 +71,27 @@ func resolve(ctx context.Context, command, version string) (string, error) {
 
 	return result.(string), nil
 }
+
+// safeInstall wraps doInstall with panic recovery. Without this,
+// singleflight wraps any panic in *panicError and re-raises it via
+// `go panic(...)` (see golang.org/x/sync/singleflight), which is
+// unrecoverable by callers and crashes the process. Issue #2765.
+func safeInstall(ctx context.Context, command, version string) (path string, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "Panic during tool auto-install",
+				"command", command, "panic", r, "stack", string(debug.Stack()))
+			path = ""
+			err = fmt.Errorf("auto-install for %q panicked: %v", command, r)
+		}
+	}()
+	return doInstallFn(ctx, command, version)
+}
+
+// doInstallFn is the install function safeInstall delegates to. Indirected
+// through a var so tests can swap in a panicking implementation to verify
+// the recover path. Production code never reassigns this.
+var doInstallFn = doInstall
 
 // doInstall performs the actual package resolution and installation.
 func doInstall(ctx context.Context, command, versionRef string) (string, error) {
@@ -77,8 +101,6 @@ func doInstall(ctx context.Context, command, versionRef string) (string, error) 
 	if info, err := os.Stat(binPath); err == nil && info.Mode()&0o111 != 0 {
 		return binPath, nil
 	}
-
-	slog.Info("Auto-installing missing command via aqua registry", "command", command)
 
 	registry := SharedRegistry()
 
@@ -95,17 +117,62 @@ func doInstall(ctx context.Context, command, versionRef string) (string, error) 
 	}
 
 	pkgName := pkg.RepoOwner + "/" + pkg.RepoName
-	slog.Info("Installing tool", "command", command, "package", pkgName, "version", version)
+	slog.InfoContext(ctx, "Auto-installing missing command",
+		"command", command, "package", pkgName, "version", version)
+	announceInstall(command, pkgName, version)
 
 	binaryPath, err := registry.Install(ctx, pkg, version)
 	if err != nil {
 		return "", fmt.Errorf("installing %s@%s: %w", pkgName, version, err)
 	}
 
-	slog.Info("Successfully installed command",
+	slog.InfoContext(ctx, "Successfully installed command",
 		"command", command, "package", fmt.Sprintf("%s@%s", pkgName, version), "path", binaryPath)
 
 	return binaryPath, nil
+}
+
+// announceInstall prints a single user-visible line to stderr right
+// before downloading a tool, so the user understands what the
+// upcoming `go install` / GitHub-release chatter is about. We
+// intentionally avoid stdout so this never gets piped into the
+// agent's prompt or programmatic output.
+//
+// fatih/color's global NoColor is computed from stdout, so we cannot
+// rely on it: when stderr is redirected (e.g. `agent run ... 2>log`)
+// stdout may still be a TTY and emit escapes into the log, and when
+// stdout is piped (e.g. `agent run ... | tee log`) but stderr is a
+// TTY, NoColor is true and the styled branch silently degrades to
+// plain text. Decide based on stderr explicitly and force colour on
+// the local *color.Color values; honour NO_COLOR / TERM=dumb.
+func announceInstall(command, pkgName, version string) {
+	if stderrSupportsColor() {
+		// fatih/color's package-level NoColor is set from stdout's TTY
+		// state, so when stdout is piped but stderr is still a TTY the
+		// SprintFunc helpers would silently strip ANSI codes. Force the
+		// local colours on after we've decided stderr can handle them.
+		bold := color.New(color.Bold)
+		bold.EnableColor()
+		faint := color.New(color.Faint)
+		faint.EnableColor()
+		fmt.Fprintf(os.Stderr, "Installing %s %s\n",
+			bold.Sprint(command), faint.Sprintf("(%s@%s)", pkgName, version))
+		return
+	}
+	fmt.Fprintf(os.Stderr, "Installing %s (%s@%s)\n", command, pkgName, version)
+}
+
+// stderrSupportsColor reports whether ANSI escapes are safe to write
+// to os.Stderr.
+func stderrSupportsColor() bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	if os.Stderr == nil {
+		return false
+	}
+	fd := os.Stderr.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 // lookupPackage resolves the aqua package for a command.

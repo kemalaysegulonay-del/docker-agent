@@ -15,14 +15,14 @@ _Get docker-agent running on your system in minutes._
 
 ## Docker Desktop (Pre-installed)
 
-Starting with [Docker Desktop 4.49.0](https://docs.docker.com/desktop/release-notes/#4490), **docker-agent is already available**. No separate installation needed — just open a terminal and run:
+Starting with [Docker Desktop 4.63](https://docs.docker.com/desktop/release-notes/#4630), **docker-agent is already available**. No separate installation needed — just open a terminal and run:
 
 ```bash
 $ docker agent version
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Tip
+<div class="callout-title">Tip
 </div>
   <p>Docker Desktop bundles docker-agent and keeps it up to date. This is the easiest way to get started, especially if you want to use Docker MCP tools and Docker Model Runner.</p>
 
@@ -74,7 +74,7 @@ For the latest features, or to contribute, build from source:
 ### Prerequisites
 
 - [Go 1.26](https://go.dev/dl/) or higher
-- [mise](https://mise.jdx.dev/getting-started.html) (build tool)
+- [Task](https://taskfile.dev/installation/) (build tool)
 - [golangci-lint](https://golangci-lint.run/docs/welcome/install/local/) (for linting)
 
 ```bash
@@ -83,16 +83,16 @@ git clone https://github.com/docker/docker-agent.git
 cd docker-agent
 
 # Build the binary
-mise build
+task build
 
 # The binary is at ./bin/docker-agent
 ./bin/docker-agent --help
 ```
 
 <div class="callout callout-tip" markdown="1">
-<div class="callout-title">💡 Building on Windows
+<div class="callout-title">Building on Windows
 </div>
-  <p>On Windows, use <code>mise build-local</code> instead of <code>mise build</code>. This builds the binary inside a Docker container using Docker Buildx, which avoids issues with Windows-specific toolchain setup and CGo cross-compilation. The output goes to the <code>./dist</code> directory.</p>
+  <p>On Windows, use <code>task build-local</code> instead of <code>task build</code>. This builds the binary inside a Docker container using Docker Buildx, which avoids issues with Windows-specific toolchain setup and CGo cross-compilation. The output goes to the <code>./dist</code> directory.</p>
 
 </div>
 
@@ -104,12 +104,14 @@ docker-agent needs API keys for the model providers you want to use. Set them as
 # Pick one (or more) depending on your provider
 export OPENAI_API_KEY="sk-..."           # OpenAI
 export ANTHROPIC_API_KEY="sk-ant-..."    # Anthropic
-export GOOGLE_API_KEY="AI..."           # Google Gemini
-export MISTRAL_API_KEY="..."            # Mistral
+export GOOGLE_API_KEY="AI..."            # Google Gemini (or GEMINI_API_KEY)
+export MISTRAL_API_KEY="..."             # Mistral
 ```
 
+See [Configuration Overview]({{ '/configuration/overview/#environment-variables' | relative_url }}) for the full list of supported providers and environment variables.
+
 <div class="callout callout-info" markdown="1">
-<div class="callout-title">ℹ️ Note
+<div class="callout-title">Note
 </div>
   <p>You only need the key(s) for the provider(s) you configure in your agent YAML. If you use Docker Model Runner (DMR), no API key is needed — models run locally.</p>
 
