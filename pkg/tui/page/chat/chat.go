@@ -649,17 +649,12 @@ func (p *chatPage) handleSendMsg(msg msgtypes.SendMsg) (layout.Model, tea.Cmd) {
 		return p, core.CmdHandler(msgtypes.ExitSessionMsg{})
 	}
 
-	// Allow immediate slash commands (e.g. /exit, /compact) even in read-only mode
-	if cmd := p.parseImmediateCommand(msg.Content); cmd != nil {
+	if msg.BypassQueue || isBangCommand(msg.Content) {
+		cmd := p.processMessage(msg)
 		return p, cmd
 	}
 
-	if p.app != nil && p.app.IsReadOnly() {
-		return p, notification.WarningCmd("Session is read-only. No new messages can be sent.")
-	}
-
-	if msg.BypassQueue || isBangCommand(msg.Content) {
-		cmd := p.processMessage(msg)
+	if cmd := p.parseImmediateCommand(msg.Content); cmd != nil {
 		return p, cmd
 	}
 

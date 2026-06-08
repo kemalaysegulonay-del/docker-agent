@@ -44,7 +44,6 @@ type App struct {
 	cancel                 context.CancelFunc
 	currentAgentModel      string                      // Tracks the current agent's model ID from AgentInfoEvent
 	exitAfterFirstResponse bool                        // Exit TUI after first assistant response completes
-	readOnly               bool                        // When true, no new messages can be sent to the LLM
 	titleGenerating        atomic.Bool                 // True when title generation is in progress
 	titleGen               *sessiontitle.Generator     // Title generator for local runtime (nil for remote)
 	snapshotController     builtins.SnapshotController // Drives /undo, /snapshots, /reset; nil for runtimes that don't capture snapshots
@@ -92,14 +91,6 @@ func WithQueuedMessages(msgs []string) Opt {
 func WithTitleGenerator(gen *sessiontitle.Generator) Opt {
 	return func(a *App) {
 		a.titleGen = gen
-	}
-}
-
-// WithReadOnly marks the session as read-only: the conversation history
-// is displayed but no new messages can be sent to the LLM.
-func WithReadOnly() Opt {
-	return func(a *App) {
-		a.readOnly = true
 	}
 }
 
@@ -924,12 +915,6 @@ func (a *App) SupportsModelSwitching() bool {
 // after the first assistant response completes.
 func (a *App) ShouldExitAfterFirstResponse() bool {
 	return a.exitAfterFirstResponse
-}
-
-// IsReadOnly returns true when the session is in read-only mode and no new
-// messages should be sent to the LLM.
-func (a *App) IsReadOnly() bool {
-	return a.readOnly
 }
 
 func (a *App) CompactSession(ctx context.Context, additionalPrompt string) {
